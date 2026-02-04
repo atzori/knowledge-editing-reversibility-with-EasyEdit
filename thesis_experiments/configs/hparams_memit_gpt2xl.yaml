@@ -1,0 +1,41 @@
+# EasyEdit ROME hyperparameters (consumed by load_hparams)
+# Keep ALL ROME-related settings here (mom2, layers, stats_dir, device, etc.)
+
+alg_name: "MEMIT"
+model_name: "gpt2-xl"
+
+# ROME regularization / misc
+v_weight_decay: 0.0
+kl_factor: 0.0
+mom2_adjustment: true
+
+# Second-moment (mom2) stats settings
+mom2_dataset: "wikipedia"
+mom2_n_samples: 10000
+mom2_dtype: "float32"
+
+layer_selection: "all"
+mom2_update_weight: 1.0
+
+# Core ROME parameters
+layers: [17]
+fact_token: "subject_last"
+
+v_num_grad_steps: 20
+v_lr: 0.1
+v_loss_layer: 0
+clamp_norm_factor: 4.0
+
+# Module templates (GPT-2)
+rewrite_module_tmp: "transformer.h.{}.mlp.c_proj"
+layer_module_tmp: "transformer.h.{}"
+mlp_module_tmp: "transformer.h.{}.mlp"
+attn_module_tmp: "transformer.h.{}.attn"
+
+ln_f_module: "transformer.ln_f"
+lm_head_module: "transformer.wte"
+
+
+# Runtime
+stats_dir: "thesis_experiments\\stats"
+device: 0
