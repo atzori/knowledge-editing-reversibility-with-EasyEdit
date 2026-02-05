@@ -14,6 +14,29 @@ import json
 
 import torch
 
+import os
+import multiprocessing as mp
+
+# ----------------------------
+# Multiprocessing safety (Linux/macOS)
+# ----------------------------
+# We do NOT silence the HuggingFace tokenizers fork warning.
+# Instead, we prevent fork-based multiprocessing after tokenizer/model initialization
+# by forcing the "spawn" start method on POSIX systems.
+#
+# This should eliminate "process just got forked" warnings by removing the fork itself,
+# not by filtering warnings.
+if sys.platform != "win32":
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        # Start method may already be set by the environment (e.g., SLURM wrappers)
+        pass
+    try:
+        torch.multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
 # ----------------------------
 # Clean warnings
 # ----------------------------
@@ -236,10 +259,11 @@ def main():
         raise ValueError(f"Invalid hparams YAML structure (expected mapping) in: {exp_hparams_path}")
     if "alg_name" not in hparams_cfg:
         raise ValueError(f"Hparams YAML must contain 'alg_name'. Missing in: {exp_hparams_path}")
-    
-    # Number of edits to apply in this run (default: MEMIT hparams batch_size, fallback to 1)
-    edit_batch_size = int(hparams_cfg.get("exp_num_edits", 5))
 
+    # ----------------------------
+    # Sample selection + runner params
+    # ----------------------------
+    sample_index = _as_int(cfg.get("exp_sample_index", 0), 0)
     forced_model_name = str(cfg.get("exp_forced_model_name", "gpt2-xl")).strip()
     max_new_tokens = _as_int(cfg.get("exp_max_new_tokens", 20), 20)
     temperature = float(cfg.get("exp_temperature", 1.0) or 1.0)
@@ -277,16 +301,6 @@ def main():
         if be_ppl_max_length <= 0:
             raise ValueError(f"be_ppl_max_length must be > 0 when provided. Got: {be_ppl_max_length_raw}")
 
-    class _Sample:
-        def __init__(self, d: Dict[str, Any]):
-            self.case_id = d.get("case_id", "")
-            self.prompt = d["prompt"]
-            self.subject = d["subject"]
-            self.ground_truth = d["ground_truth"]
-            self.target_new = d["target_new"]
-            self.locality_prompts = d.get("locality_prompts", [])
-            self.portability_prompts = d.get("portability_prompts", [])
-
     # ----------------------------
     # Load dataset records
     # ----------------------------
@@ -305,34 +319,26 @@ def main():
     else:
         raw_records, dataset_source = _load_records(cfg_path, cfg)
 
-    # Build the list of sample indices to edit (N = edit_batch_size)
-    base_index = _as_int(cfg.get("exp_sample_index", 0), 0)
-    dataset_size = len(raw_records)
+    if not raw_records:
+        raise RuntimeError("No records loaded from dataset (empty list).")
+    if sample_index < 0 or sample_index >= len(raw_records):
+        raise IndexError(f"exp_sample_index={sample_index} out of range. Dataset size={len(raw_records)}")
 
-    # Optional: allow explicit indices from YAML
-    explicit_indices = cfg.get("exp_sample_indices", None)
-    if explicit_indices is not None:
-        # Wrap explicit indices with modulo
-        sample_indices = [int(x) % dataset_size for x in explicit_indices]
-    else:
-        # Default: contiguous block with automatic wrap-around
-        sample_indices = [
-            (base_index + offset) % dataset_size
-            for offset in range(edit_batch_size)
-        ]
-    
+    rec_raw = raw_records[sample_index]
+    rec = _normalize_record(rec_raw, dataset_type)
 
-    
-    # Normalize all records -> build a batch of Samples
-    samples: List[_Sample] = []
-    sample_prompts: List[str] = []
-    for idx in sample_indices:
-        rec_raw = raw_records[idx]
-        rec = _normalize_record(rec_raw, dataset_type)
-        samples.append(_Sample(rec))
-        sample_prompts.append(str(rec["prompt"]).rstrip())
+    class _Sample:
+        def __init__(self, d: Dict[str, Any]):
+            self.case_id = d.get("case_id", "")
+            self.prompt = d["prompt"]
+            self.subject = d["subject"]
+            self.ground_truth = d["ground_truth"]
+            self.target_new = d["target_new"]
+            self.locality_prompts = d.get("locality_prompts", [])
+            self.portability_prompts = d.get("portability_prompts", [])
 
-    
+    sample = _Sample(rec)
+    sample_prompt = str(sample.prompt).rstrip()
 
     # ----------------------------
     # Load hparams + build editor
@@ -364,7 +370,6 @@ def main():
     try:
         log_step("Instantiating BaseEditor and model (may download/load from cache).")
         editor: BaseEditor = BaseEditor.from_hparams(hparams)
-        print_color(f"[DEBUG] Editor class: {editor.__class__.__name__}", "green")
     except RuntimeError as e:
         if _is_cuda_oom(e):
             log_step("Aborted: CUDA OOM while instantiating the model.", "ERROR")
@@ -430,39 +435,30 @@ def main():
         print(f"hf_split: {cfg.get('hf_split', 'test')}")
         print(f"hf_subset: {cfg.get('hf_subset', None)}")
     print(f"dataset_size_loaded: {len(raw_records)}")
-    print(f"edit_batch_size: {edit_batch_size}")
-    if edit_batch_size == 1:
-        print(f"sample_index: {base_index} (single sample)")
-    else:
-        print(f"sample_indices: {sample_indices} (batch of {edit_batch_size} samples)")
-    
-    for sample in samples:
-        print(f"case_id: {sample.case_id}")
-        print(f"prompt: {sample.prompt}")
-        print(f"subject: {sample.subject}")
-        print(f"ground_truth: {sample.ground_truth}")
-        print(f"target_new: {sample.target_new}")
-        print(f"locality_prompts: {len(sample.locality_prompts)}")
-        print(f"portability_prompts: {len(sample.portability_prompts)}\n")
+    print(f"sample_index: {sample_index}")
+    print(f"case_id: {sample.case_id}")
+    print(f"prompt: {sample_prompt}")
+    print(f"subject: {sample.subject}")
+    print(f"ground_truth: {sample.ground_truth}")
+    print(f"target_new: {sample.target_new}")
+    print(f"locality_prompts: {len(sample.locality_prompts)}")
+    print(f"portability_prompts: {len(sample.portability_prompts)}\n")
 
     # ----------------------------
     # Populate results metadata (for results.json)
     # ----------------------------
-    for sample in samples:
-        i = 0
-        results_json.update({
-            "Case ": i,
-            "method": method,
-            "dataset_type": dataset_type,
-            "dataset_source": dataset_source,
-            "dataset_size_loaded": len(raw_records),
-            "sample_index": sample_indices,
-            "case_id": sample.case_id,
-            "prompt": sample.prompt,
-            "subject": sample.subject,
-            "ground_truth": sample.ground_truth,
-            "target_new": sample.target_new,
-        })
+    results_json.update({
+        "method": method,
+        "dataset_type": dataset_type,
+        "dataset_source": dataset_source,
+        "dataset_size_loaded": len(raw_records),
+        "sample_index": sample_index,
+        "case_id": sample.case_id,
+        "prompt": sample_prompt,
+        "subject": sample.subject,
+        "ground_truth": sample.ground_truth,
+        "target_new": sample.target_new,
+    })
     results_json["counts"]["locality_prompts"] = len(sample.locality_prompts)
     results_json["counts"]["portability_prompts"] = len(sample.portability_prompts)
 
@@ -493,26 +489,23 @@ def main():
     # ----------------------------
     # M0: behavioral probe
     # ----------------------------
-    for sample in samples:
-        try:
-            log_step("Behavioral probe (M0).")
-            log_step(f"CASE {sample.case_id} PROMPT: {sample.prompt}")
-            
-            comp = generate_completion(
-                editor.model,
-                tok,
-                sample.prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-            )
-            print("\n=== BEHAVIORAL (M0) ===")
-            print(comp)
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during behavioral probe (M0).", "ERROR")
-                return
-            raise
+    try:
+        log_step("Behavioral probe (M0).")
+        comp0 = generate_completion(
+            editor.model,
+            tok,
+            sample_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+        )
+        print("\n=== BEHAVIORAL (M0) ===")
+        print(comp0)
+    except RuntimeError as e:
+        if _is_cuda_oom(e):
+            log_step("Aborted: CUDA OOM during behavioral probe (M0).", "ERROR")
+            return
+        raise
 
     metrics_fwd = None
     metrics_inv = None
@@ -531,41 +524,16 @@ def main():
             extra_eval["portability_prompts"] = sample.portability_prompts
 
         try:
-            metrics_fwd = []
-            edited_model = None
-
-            for k, s in enumerate(samples):
-                sample_prompt = str(s.prompt).rstrip()
-
-                log_step(f"[BATCH] Forward edit {k+1}/{len(samples)} | idx={sample_indices[k]} | case_id={s.case_id}", "INFO")
-
-                extra_eval = {}
-                if isinstance(s.locality_prompts, list) and s.locality_prompts:
-                    extra_eval["locality_prompts"] = s.locality_prompts
-                if isinstance(s.portability_prompts, list) and s.portability_prompts:
-                    extra_eval["portability_prompts"] = s.portability_prompts
-
-                m_k, edited_model = _call_apply_edit(
-                    editor,
-                    prompt=sample_prompt,
-                    subject=s.subject,
-                    ground_truth=s.ground_truth,
-                    target_new=s.target_new,
-                    verbose=verbose,
-                    suppress_internal_prints=suppress_internal,
-                    **extra_eval,
-                )
-
-                metrics_fwd.append({
-                "sample_index": sample_indices[k],
-                "case_id": s.case_id,
-                "metrics": m_k,
-                })
-
-
-                # IMPORTANT: make edits cumulative by switching the editor's model
-                editor.model = edited_model
-
+            metrics_fwd, edited_model = _call_apply_edit(
+                editor,
+                prompt=sample_prompt,
+                subject=sample.subject,
+                ground_truth=sample.ground_truth,
+                target_new=sample.target_new,
+                verbose=verbose,
+                suppress_internal_prints=suppress_internal,
+                **extra_eval,
+            )
         except RuntimeError as e:
             if _is_cuda_oom(e):
                 log_step("Aborted: CUDA OOM during FORWARD edit.", "ERROR")
@@ -675,52 +643,16 @@ def main():
             extra_eval["portability_prompts"] = sample.portability_prompts
 
         try:
-            metrics_inv = []
-            rollback_model = None
-
-            # IMPORTANT: rollback must be applied in reverse order to undo cumulative edits
-            for k, s in enumerate(reversed(samples)):
-                idx = sample_indices[len(samples) - 1 - k]
-                sample_prompt = str(s.prompt).rstrip()
-
-                log_step(
-                    f"[BATCH] Rollback edit {k+1}/{len(samples)} | idx={idx} | case_id={s.case_id}",
-                    "INFO",
-                )
-
-                extra_eval = {}
-                if isinstance(s.locality_prompts, list) and s.locality_prompts:
-                    extra_eval["locality_prompts"] = s.locality_prompts
-                if isinstance(s.portability_prompts, list) and s.portability_prompts:
-                    extra_eval["portability_prompts"] = s.portability_prompts
-
-                # INVERSE edit: swap GT and NEW (rollback: NEW -> GT)
-                m_k, inv_model = _call_apply_edit(
-                    editor,
-                    prompt=sample_prompt,
-                    subject=s.subject,
-                    ground_truth=s.target_new,  # was NEW in forward
-                    target_new=s.ground_truth,  # restore GT
-                    verbose=verbose,
-                    suppress_internal_prints=suppress_internal,
-                    **extra_eval,
-                )
-
-                metrics_inv.append({
-                "sample_index": sample_indices[k],
-                "case_id": s.case_id,
-                "metrics": m_k,
-                })
-
-
-                # IMPORTANT: keep rollback cumulative by switching the editor's model
-                editor.model = inv_model
-                # Inversion of cumulative edits must be applied in reverse order to properly undo them, 
-                # but metrics are collected in forward order for easier interpretation 
-                # (first item corresponds to first edit, etc). We'll reverse the metrics list at the end to match the order of edits.
-                metrics_inv = list(reversed(metrics_inv))
-
-
+            metrics_inv, inv_model = _call_apply_edit(
+                editor,
+                prompt=sample_prompt,
+                subject=sample.subject,
+                ground_truth=sample.target_new,
+                target_new=sample.ground_truth,
+                verbose=verbose,
+                suppress_internal_prints=suppress_internal,
+                **extra_eval,
+            )
         except RuntimeError as e:
             if _is_cuda_oom(e):
                 log_step("Aborted: CUDA OOM during inverse-only edit.", "ERROR")
