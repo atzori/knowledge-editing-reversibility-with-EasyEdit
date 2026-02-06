@@ -204,7 +204,7 @@ def layer_stats(
         collate_fn=length_collation(batch_tokens),
         pin_memory=True,
         random_sample=1,
-        num_workers=0 if os.name == "nt" else min(4, os.cpu_count() or 1),
+        num_workers=0,
     )
 
     # Compute total number of batches for progress

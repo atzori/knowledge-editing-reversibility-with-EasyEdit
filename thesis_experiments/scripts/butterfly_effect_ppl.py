@@ -129,23 +129,11 @@ def compute_ppl(
             raise ValueError(f"max_length too small. Got: {max_length}")
         max_tokenized_len = max_length - 1 if add_start_token else max_length
 
-    enc = tokenizer(
-        texts,
-        add_special_tokens=False,
-        padding=True,
-        truncation=(max_tokenized_len is not None),
-        max_length=max_tokenized_len,
-        return_tensors="pt",
-        return_attention_mask=True,
-    )
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
-
     loss_fct = CrossEntropyLoss(reduction="none")
     ppls: List[float] = []
 
-    # Iterate in mini-batches
-    n = input_ids.size(0)
+    # Iterate in mini-batches and move only the active batch to GPU.
+    n = len(texts)
     num_batches = (n + batch_size - 1) // batch_size
 
     for batch_idx in tqdm(
@@ -157,8 +145,18 @@ def compute_ppl(
         start = batch_idx * batch_size
         end = min(start + batch_size, n)
 
-        batch_ids = input_ids[start:end]
-        batch_attn = attention_mask[start:end]
+        # Tokenize with padding/truncation as needed. We disable special tokens here to have more control,
+        enc = tokenizer(
+            texts[start:end],
+            add_special_tokens=False,
+            padding=True,
+            truncation=(max_tokenized_len is not None),
+            max_length=max_tokenized_len,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        batch_ids = enc["input_ids"].to(device)
+        batch_attn = enc["attention_mask"].to(device)
 
 
         if add_start_token:
@@ -169,7 +167,8 @@ def compute_ppl(
             batch_ids = torch.cat([bos, batch_ids], dim=1)
             batch_attn = torch.cat([torch.ones_like(bos, dtype=batch_attn.dtype), batch_attn], dim=1)
 
-        out = model(batch_ids, attention_mask=batch_attn)
+        # Disable KV cache: it's useful for autoregressive generation, not for PPL.
+        out = model(batch_ids, attention_mask=batch_attn, use_cache=False)
         logits = out.logits  # [B, T, V]
 
         # Shift for next-token prediction

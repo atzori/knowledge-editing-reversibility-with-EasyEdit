@@ -7,7 +7,7 @@ exp_hparams_path: "thesis_experiments/configs/hparams_rome_gpt2xl.yaml"
 
 # Dataset type: "knowedit" or "counterfact"
 exp_dataset_type: "counterfact"
-exp_local_dataset: thesis_experiments\data\counterfact\test.json
+exp_local_dataset: thesis_experiments/data/counterfact/test.json
 
 # Dataset source (choose ONE):
 # - HuggingFace dataset:
@@ -28,7 +28,7 @@ exp_forced_model_name: "gpt2-xl"
 exp_max_new_tokens: 5
 exp_temperature: 0.7
 exp_do_sample: true
-exp_suppress_internal_prints: true
+exp_suppress_internal_prints: false
 exp_verbose: false
 exp_allow_hf_fallback: false
 
@@ -37,8 +37,8 @@ be_enabled: true
 
 be_ppl_data_path: data/me_ppl/ME-PPL_1k.json
 be_ppl_text_key: "Text"
-be_ppl_max_items: 1000 #50
-be_ppl_batch_size: 100 #16
+be_ppl_max_items: 200
+be_ppl_batch_size: 25
 be_ppl_add_start_token: false
 be_ppl_max_length: 128
 

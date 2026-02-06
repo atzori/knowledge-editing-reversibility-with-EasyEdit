@@ -3,6 +3,7 @@ from datetime import datetime
 import json
 import sys
 import inspect
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 import argparse
 import yaml
@@ -13,6 +14,31 @@ import json
 
 
 import torch
+
+import os
+
+# ----------------------------
+# Path utilities (portable)
+# ----------------------------
+def _resolve_cfg_path(cfg_file: Path, raw_path: Any) -> Path:
+    """Resolve a path from YAML in a cross-platform way.
+
+    - Expands env vars and ~
+    - If relative, resolves against the YAML file directory
+    - Normalizes and returns an absolute Path
+    """
+    if raw_path is None:
+        raise ValueError("Path value is None")
+
+    if isinstance(raw_path, Path):
+        p = raw_path
+    else:
+        p = Path(os.path.expandvars(os.path.expanduser(str(raw_path).strip())))
+
+    if not p.is_absolute():
+        p = (cfg_file.parent / p)
+
+    return p.resolve()
 
 # ----------------------------
 # Clean warnings
@@ -62,6 +88,23 @@ from easyeditor import BaseEditor
 startTime = str(datetime.now().isoformat()).replace(":", "")
 set_start_time(startTime)
 
+def _hparams_to_dict(hparams_obj: Any) -> Any:
+    """
+    Best-effort conversion of hparams (usually a dataclass) to a JSON-serializable dict.
+    Falls back to vars()/str() if needed.
+    """
+    if hparams_obj is None:
+        return None
+    try:
+        if is_dataclass(hparams_obj):
+            return asdict(hparams_obj)
+    except Exception:
+        pass
+    try:
+        return dict(vars(hparams_obj))
+    except Exception:
+        return str(hparams_obj)
+
 def _load_counterfact_with_local_priority(
     cfg_path: Path,
     cfg: dict,
@@ -85,7 +128,7 @@ def _load_counterfact_with_local_priority(
     # Case 1: local dataset specified
     # ----------------------------
     if local_path_raw:
-        local_path = _resolve_path_like_cfg(cfg_path, local_path_raw)
+        local_path = Path(local_path_raw)
 
         if local_path.exists():
             log_step(f"Loading CounterFact from LOCAL path: {local_path}", "INFO")
@@ -206,13 +249,16 @@ def main():
     # ----------------------------
     # Experiment config loading
     # ----------------------------
-    cfg_path = Path(args.config)
+    cfg_path = Path(args.config).expanduser().resolve()
     if not cfg_path.exists():
         raise_path_error("Experiment config file", cfg_path)
 
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     if not isinstance(cfg, dict):
         raise ValueError(f"Invalid YAML structure (expected mapping) in: {cfg_path}")
+
+    # Persist full experiment config into results.json for reproducibility.
+    results_json["exp_config"] = cfg
 
     method = str(cfg.get("exp_method", "rome")).lower().strip()
     if method not in ("rome", "memit"):
@@ -227,7 +273,12 @@ def main():
     if not exp_hparams_path_raw:
         raise ValueError("Missing exp_hparams_path in experiment config (must point to a separate hparams YAML).")
 
-    exp_hparams_path = _resolve_path_like_cfg(cfg_path, exp_hparams_path_raw)
+    exp_hparams_path_pieces = exp_hparams_path_raw.split("//")
+    exp_hparams_path = ""
+    for piece in exp_hparams_path_pieces:
+        exp_hparams_path += piece.strip()
+    print_color(f"Resolved exp_hparams_path: {exp_hparams_path}", "green")
+    exp_hparams_path = Path(exp_hparams_path)
     if not exp_hparams_path.exists():
         raise_path_error("Hparams config file", exp_hparams_path)
 
@@ -236,6 +287,9 @@ def main():
         raise ValueError(f"Invalid hparams YAML structure (expected mapping) in: {exp_hparams_path}")
     if "alg_name" not in hparams_cfg:
         raise ValueError(f"Hparams YAML must contain 'alg_name'. Missing in: {exp_hparams_path}")
+
+    # Persist raw hparams YAML contents into results.json (before runtime overrides).
+    results_json["hparams_config"] = hparams_cfg
 
     # ----------------------------
     # Sample selection + runner params
@@ -294,7 +348,7 @@ def main():
             allow_hf_fallback=allow_hf_fallback,
         )
     else:
-        raw_records, dataset_source = _load_records(cfg_path, cfg)
+        raw_records, dataset_source = _load_records(os.path.join("thesis_experiments", "data"), cfg)
 
     if not raw_records:
         raise RuntimeError("No records loaded from dataset (empty list).")
@@ -334,12 +388,16 @@ def main():
         if hasattr(hparams, attr):
             setattr(hparams, attr, None)
 
+    # Persist effective (runtime) hparams after overrides.
+    results_json["hparams"] = _hparams_to_dict(hparams)
+
     # Ensure stats_dir exists if present in hparams (ROME uses it)
     if hasattr(hparams, "stats_dir"):
         stats_dir = getattr(hparams, "stats_dir")
         if stats_dir in (None, "", "null"):
             raise ValueError("stats_dir in hparams is empty/None. Set stats_dir to a valid folder path in the hparams YAML.")
-        Path(str(stats_dir)).mkdir(parents=True, exist_ok=True)
+        stats_dir_path = _resolve_cfg_path(exp_hparams_path, stats_dir)
+        stats_dir_path.mkdir(parents=True, exist_ok=True)
 
     _log_stats_cache_status(hparams)
 
@@ -382,7 +440,7 @@ def main():
             log_step("BE enabled but 'be_ppl_data_path' is missing in config YAML.", "ERROR")
             raise ValueError("be_enabled=True but 'be_ppl_data_path' is missing in config YAML.")
 
-        be_ppl_data_path = _resolve_path_like_cfg(cfg_path, be_ppl_data_path_raw)
+        be_ppl_data_path = Path(be_ppl_data_path_raw)
         if not be_ppl_data_path.exists():
             raise_path_error("BE PPL dataset file", be_ppl_data_path)
 
@@ -784,8 +842,10 @@ def main():
     # Finalize + persist results.json ONLY after everything is computed
     # ----------------------------
     results_json["elapsed_sec"] = float(perf_counter() - t0)
-    save_results_json( results_json, path="logs/logs-" + startTime+"/results.json")
-    log_step(f"Saved metrics JSON to logs/logs-{startTime}/results.json (elapsed_sec={results_json['elapsed_sec']:.3f}).", "INFO")
+    logs_dir = Path("logs") / f"logs-{startTime}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    save_results_json(results_json, path=logs_dir / "results.json")
+    log_step(f"Saved metrics JSON to {logs_dir / 'results.json'} (elapsed_sec={results_json['elapsed_sec']:.3f}).", "INFO")
 
 if __name__ == "__main__":
     main()
