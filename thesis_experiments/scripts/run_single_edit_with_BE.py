@@ -105,6 +105,30 @@ def _hparams_to_dict(hparams_obj: Any) -> Any:
     except Exception:
         return str(hparams_obj)
 
+def _pick_device_for_tensors(hparams_obj: Any, model: Any) -> str:
+    """
+    Pick a device string for input tensors / eval loops.
+
+    - If model parallel (HF device_map), inputs should go to the model's first parameter device.
+    - Otherwise, prefer hparams.device (e.g. cuda:1) to avoid accidental moves to cuda:0.
+    """
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    model_parallel = bool(getattr(hparams_obj, "model_parallel", False))
+    has_device_map = hasattr(model, "hf_device_map")
+
+    if model_parallel or has_device_map:
+        try:
+            return str(next(model.parameters()).device)
+        except Exception:
+            return "cuda"
+
+    dev = getattr(hparams_obj, "device", None)
+    if dev is None or str(dev) == "-1":
+        return "cuda"
+    return f"cuda:{dev}"
+
 def _load_counterfact_with_local_priority(
     cfg_path: Path,
     cfg: dict,
@@ -419,18 +443,41 @@ def main():
     # ----------------------------
     # BE: load PPL texts + choose device
     # ----------------------------
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log_step(f"Selected device: {device}")
+    device = _pick_device_for_tensors(hparams, editor.model)
+    model_parallel = bool(getattr(hparams, "model_parallel", False))
+    has_device_map = hasattr(editor.model, "hf_device_map")
+    log_step(
+        f"Selected device for tensors: {device} "
+        f"(model_parallel={model_parallel}, device_map={'yes' if has_device_map else 'no'})"
+    )
 
-    # Move baseline model once (time-consuming + can OOM)
-    try:
-        log_step("Moving baseline model to device (may take time).")
-        editor.model.to(device)
-    except RuntimeError as e:
-        if _is_cuda_oom(e):
-            log_step("Aborted: CUDA OOM while moving baseline model to device.", "ERROR")
+    def _maybe_move_model_to_device(model, label: str) -> None:
+        if device == "cpu":
             return
-        raise
+        if model_parallel or has_device_map:
+            log_step(f"{label}: model parallel/device_map detected; skipping .to(...) to preserve sharding.", "INFO")
+            return
+        try:
+            cur = str(next(model.parameters()).device)
+        except Exception:
+            cur = None
+        if cur == device:
+            log_step(f"{label}: already on {cur}; skipping .to(...).", "INFO")
+            return
+        try:
+            log_step(f"{label}: moving to {device} (was {cur}).", "INFO")
+            model.to(device)
+        except RuntimeError as e:
+            if _is_cuda_oom(e):
+                log_step(f"Aborted: CUDA OOM while moving {label.lower()} to device.", "ERROR")
+                raise
+            raise
+
+    # Baseline model is usually already placed by BaseEditor; keep this as a safety net.
+    try:
+        _maybe_move_model_to_device(editor.model, "Baseline model")
+    except RuntimeError:
+        return
 
     ppl_texts: List[str] = []
     ppl_m0: Optional[float] = None
@@ -579,8 +626,7 @@ def main():
 
         # Ensure edited model is on the right device for PPL / generation
         try:
-            log_step("Moving edited model to device (may take time).")
-            edited_model.to(device)
+            _maybe_move_model_to_device(edited_model, "Edited model")
         except RuntimeError as e:
             if _is_cuda_oom(e):
                 log_step("Aborted: CUDA OOM while moving edited model to device.", "ERROR")
@@ -754,8 +800,7 @@ def main():
 
         # Ensure rollback model is on the right device
         try:
-            log_step("Moving rollback model to device (may take time).")
-            rollback_model.to(device)
+            _maybe_move_model_to_device(rollback_model, "Rollback model")
         except RuntimeError as e:
             if _is_cuda_oom(e):
                 log_step("Aborted: CUDA OOM while moving rollback model to device.", "ERROR")
