@@ -86,6 +86,10 @@ warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 startTime = str(datetime.now().isoformat()).replace(":", "")
 set_start_time(startTime)
 
+def _print_azure(text: str) -> None:
+    # Bright cyan ("azure") for terminal readability.
+    print(f"\033[96m{text}\033[0m")
+
 def _hparams_to_dict(hparams_obj: Any) -> Any:
     """
     Best-effort conversion of hparams (usually a dataclass) to a JSON-serializable dict.
@@ -580,6 +584,7 @@ def main():
     do_sample = _as_bool(cfg.get("exp_do_sample", False), False)
     suppress_internal = _as_bool(cfg.get("exp_suppress_internal_prints", True), True)
     verbose = _as_bool(cfg.get("exp_verbose", False), False)
+    print_metrics_foreach_case = _as_bool(cfg.get("exp_print_metrics_foreach_case", False), False)
 
     if max_new_tokens <= 0:
         raise ValueError(f"exp_max_new_tokens must be > 0. Got: {max_new_tokens}")
@@ -666,6 +671,17 @@ def main():
     samples = [_Sample(r) for r in batch_recs]
     probe = samples[0]
     probe_prompt = str(probe.prompt).rstrip()
+
+    # ----------------------------
+    # CounterFact: print all fetched prompts in azure
+    # ----------------------------
+    if dataset_type == "counterfact":
+        _print_azure("\n=== COUNTERFACT BATCH PROMPTS (azure) ===")
+        for i, r in enumerate(batch_recs):
+            p = str(r.get("prompt", "")).rstrip()
+            gt = str(r.get("ground_truth", "")).rstrip()
+            tn = str(r.get("target_new", "")).rstrip()
+            _print_azure(f"prompt: {p}| ground_truth: {gt} --> target_new: {tn}\n")
 
     # ----------------------------
     # Load hparams + build editor
@@ -967,6 +983,8 @@ def main():
             results_json["metrics_per_case"]["forward"] = fwd_cases
 
             print_metrics_table(metrics_fwd_mean, title="FORWARD METRICS (MEAN)")
+            if print_metrics_foreach_case:
+                print_metrics_table(fwd_cases, title="FORWARD METRICS (PER CASE)")
 
             # ----------------------------
             # BE: PPL on M1 (after forward edit)
@@ -1104,6 +1122,8 @@ def main():
             results_json["metrics"]["inverse_only"] = metrics_inv_mean
             results_json["metrics_per_case"]["inverse_only"] = inv_cases
             print_metrics_table(metrics_inv_mean, title="INVERSE METRICS (MEAN)")
+            if print_metrics_foreach_case:
+                print_metrics_table(inv_cases, title="INVERSE METRICS (PER CASE)")
 
             try:
                 log_step("Behavioral probe (after inverse-only) on probe sample.")
@@ -1244,6 +1264,8 @@ def main():
                     raise
 
             print_metrics_table(metrics_rb_mean, title="INVERSE (ROLLBACK) METRICS (MEAN)")
+            if print_metrics_foreach_case:
+                print_metrics_table(rb_cases, title="INVERSE (ROLLBACK) METRICS (PER CASE)")
 
             try:
                 log_step("Behavioral probe (M2) on probe sample.")
