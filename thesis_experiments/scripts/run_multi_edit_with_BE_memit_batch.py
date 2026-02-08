@@ -3,16 +3,41 @@ from datetime import datetime
 import json
 import sys
 import inspect
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 import argparse
 import yaml
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 from datasets import load_dataset
-import json
-
+import numpy as np
 
 import torch
+
+import os
+
+# ----------------------------
+# Path utilities (portable)
+# ----------------------------
+def _resolve_cfg_path(cfg_file: Path, raw_path: Any) -> Path:
+    """Resolve a path from YAML in a cross-platform way.
+
+    - Expands env vars and ~
+    - If relative, resolves against the YAML file directory
+    - Normalizes and returns an absolute Path
+    """
+    if raw_path is None:
+        raise ValueError("Path value is None")
+
+    if isinstance(raw_path, Path):
+        p = raw_path
+    else:
+        p = Path(os.path.expandvars(os.path.expanduser(str(raw_path).strip())))
+
+    if not p.is_absolute():
+        p = (cfg_file.parent / p)
+
+    return p.resolve()
 
 # ----------------------------
 # Clean warnings
@@ -59,8 +84,51 @@ from ke_core import (
 )
 
 from easyeditor import BaseEditor
+from easyeditor.editors.utils import _prepare_requests
+from easyeditor.evaluate import compute_edit_quality
 startTime = str(datetime.now().isoformat()).replace(":", "")
 set_start_time(startTime)
+
+def _hparams_to_dict(hparams_obj: Any) -> Any:
+    """
+    Best-effort conversion of hparams (usually a dataclass) to a JSON-serializable dict.
+    Falls back to vars()/str() if needed.
+    """
+    if hparams_obj is None:
+        return None
+    try:
+        if is_dataclass(hparams_obj):
+            return asdict(hparams_obj)
+    except Exception:
+        pass
+    try:
+        return dict(vars(hparams_obj))
+    except Exception:
+        return str(hparams_obj)
+
+def _pick_device_for_tensors(hparams_obj: Any, model: Any) -> str:
+    """
+    Pick a device string for input tensors / eval loops.
+
+    - If model parallel (HF device_map), inputs should go to the model's first parameter device.
+    - Otherwise, prefer hparams.device (e.g. cuda:1) to avoid accidental moves to cuda:0.
+    """
+    if not torch.cuda.is_available():
+        return "cpu"
+
+    model_parallel = bool(getattr(hparams_obj, "model_parallel", False))
+    has_device_map = hasattr(model, "hf_device_map")
+
+    if model_parallel or has_device_map:
+        try:
+            return str(next(model.parameters()).device)
+        except Exception:
+            return "cuda"
+
+    dev = getattr(hparams_obj, "device", None)
+    if dev is None or str(dev) == "-1":
+        return "cuda"
+    return f"cuda:{dev}"
 
 def _load_counterfact_with_local_priority(
     cfg_path: Path,
@@ -85,7 +153,7 @@ def _load_counterfact_with_local_priority(
     # Case 1: local dataset specified
     # ----------------------------
     if local_path_raw:
-        local_path = _resolve_path_like_cfg(cfg_path, local_path_raw)
+        local_path = Path(local_path_raw)
 
         if local_path.exists():
             log_step(f"Loading CounterFact from LOCAL path: {local_path}", "INFO")
@@ -168,6 +236,262 @@ def _call_apply_edit(editor: BaseEditor, **kwargs):
 
     return apply_edit(editor, **filtered)
 
+
+def _metric_scalar(v: Any) -> Optional[float]:
+    """Convert a metric leaf (scalar or list of scalars) into a single float."""
+    if v is None:
+        return None
+    if isinstance(v, np.generic):
+        return float(v)
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, (list, tuple)):
+        xs: List[float] = []
+        for it in v:
+            if isinstance(it, np.generic):
+                xs.append(float(it))
+            elif isinstance(it, (int, float)):
+                xs.append(float(it))
+            else:
+                return None
+        if not xs:
+            return None
+        m = float(np.mean(xs))
+        if np.isnan(m) or np.isinf(m):
+            return None
+        return m
+    return None
+
+
+def _mean_metrics_dict(per_case_dicts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Recursively average numeric leaves across cases, weighting each case equally."""
+    out: Dict[str, Any] = {}
+    keys: set = set()
+    for d in per_case_dicts:
+        if isinstance(d, dict):
+            keys.update(d.keys())
+
+    for k in sorted(keys):
+        vals = [d.get(k) for d in per_case_dicts if isinstance(d, dict) and k in d]
+        if not vals:
+            continue
+
+        if all(isinstance(v, dict) for v in vals):
+            child = _mean_metrics_dict(vals)  # type: ignore[arg-type]
+            if child:
+                out[k] = child
+            continue
+
+        scalars: List[float] = []
+        for v in vals:
+            s = _metric_scalar(v)
+            if s is not None:
+                scalars.append(s)
+
+        if scalars:
+            out[k] = float(np.mean(scalars))
+
+    return out
+
+def _locality_outputs_to_acc(
+    *,
+    pre_quality: Dict[str, Any],
+    post_quality: Dict[str, Any],
+    request: Dict[str, Any],
+) -> None:
+    """Convert locality outputs -> acc exactly like EasyEdit's editor.py."""
+    # Only if locality outputs exist
+    pre_loc = pre_quality.get("locality", {})
+    post_loc = post_quality.get("locality", {})
+    if not isinstance(pre_loc, dict) or not isinstance(post_loc, dict):
+        pre_quality.pop("locality", None)
+        return
+
+    req_loc = request.get("locality", {})
+    if not isinstance(req_loc, dict):
+        req_loc = {}
+
+    for locality_key in req_loc.keys():
+        out_key = f"{locality_key}_output"
+        if out_key not in pre_loc or out_key not in post_loc:
+            continue
+
+        locality_result: List[float] = []
+        try:
+            for ans, label in zip(post_loc[out_key], pre_loc[out_key]):
+                locality_result.append(float(np.mean(np.equal(ans, label))))
+        except Exception:
+            for ans, label in zip(post_loc[out_key], pre_loc[out_key]):
+                locality_result.append(float(ans == label))
+
+        post_loc[f"{locality_key}_acc"] = locality_result
+        post_loc.pop(out_key, None)
+
+    # Match EasyEdit: drop PRE locality entirely
+    pre_quality.pop("locality", None)
+
+
+def _build_batch_requests(
+    records: List[Dict[str, Any]],
+    *,
+    direction: str,
+    locality_key: str = "neighborhood",
+    portability_key: str = "rephrase",
+) -> List[Dict[str, Any]]:
+    """
+    Build a list of EasyEdit request dicts for a single MEMIT batch call.
+    direction:
+      - 'forward': GT -> NEW
+      - 'inverse': NEW -> GT
+    """
+    if direction not in ("forward", "inverse"):
+        raise ValueError(f"Invalid direction='{direction}'. Expected: forward|inverse.")
+
+    prompts = [str(r["prompt"]).rstrip() for r in records]
+    subjects = [str(r["subject"]).rstrip() for r in records]
+    gt = [str(r["ground_truth"]).rstrip() for r in records]
+    tn = [str(r["target_new"]).rstrip() for r in records]
+
+    if direction == "forward":
+        target_new = tn
+        ground_truth = gt
+    else:
+        target_new = gt
+        ground_truth = tn
+
+    # Rephrase prompt: first portability prompt if present, else fallback to main prompt.
+    rephrase_prompts: List[Optional[str]] = []
+    for p, r in zip(prompts, records):
+        ports = r.get("portability_prompts", []) or []
+        if isinstance(ports, list) and ports:
+            rephrase_prompts.append(str(ports[0]).rstrip())
+        else:
+            rephrase_prompts.append(p)
+
+    # Locality inputs: one entry per edit (list[str] or None).
+    loc_prompts: List[Optional[List[str]]] = []
+    loc_gts: List[Optional[List[str]]] = []
+    any_loc = False
+    for r in records:
+        locs = r.get("locality_prompts", []) or []
+        loc_list = [str(x).rstrip() for x in (locs if isinstance(locs, list) else [locs]) if str(x).strip()]
+        if loc_list:
+            any_loc = True
+            loc_prompts.append(loc_list)
+            # Use original GT for consistent slicing in locality evaluation.
+            loc_gts.append([str(r["ground_truth"]).rstrip()] * len(loc_list))
+        else:
+            loc_prompts.append(None)
+            loc_gts.append(None)
+
+    locality_inputs = None
+    if any_loc:
+        locality_inputs = {
+            locality_key: {
+                "prompt": loc_prompts,
+                "ground_truth": loc_gts,
+            }
+        }
+
+    # Portability inputs: paraphrases should map to the desired target for this direction.
+    por_prompts: List[Optional[List[str]]] = []
+    por_gts: List[Optional[List[str]]] = []
+    any_por = False
+    for desired, r in zip(target_new, records):
+        ports = r.get("portability_prompts", []) or []
+        por_list = [str(x).rstrip() for x in (ports if isinstance(ports, list) else [ports]) if str(x).strip()]
+        if por_list:
+            any_por = True
+            por_prompts.append(por_list)
+            por_gts.append([str(desired).rstrip()] * len(por_list))
+        else:
+            por_prompts.append(None)
+            por_gts.append(None)
+
+    portability_inputs = None
+    if any_por:
+        portability_inputs = {
+            portability_key: {
+                "prompt": por_prompts,
+                "ground_truth": por_gts,
+            }
+        }
+
+    requests = _prepare_requests(
+        prompts,
+        target_new,
+        ground_truth,
+        rephrase_prompts=rephrase_prompts,
+        locality_inputs=locality_inputs,
+        portability_inputs=portability_inputs,
+        subject=subjects,
+    )
+
+    # Keep original case_id for traceability (and cache keys if enabled).
+    for req, r in zip(requests, records):
+        if "case_id" in r:
+            req["case_id"] = r["case_id"]
+
+    return requests
+
+
+def _eval_quality_per_request(
+    *,
+    model,
+    model_name: str,
+    hparams: Any,
+    tok,
+    requests: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Compute compute_edit_quality(...) for each request."""
+    device_id = getattr(hparams, "device", 0)
+    outs: List[Dict[str, Any]] = []
+    for req in requests:
+        outs.append(
+            compute_edit_quality(
+                model,
+                model_name,
+                hparams,
+                tok,
+                req,
+                device_id,
+                test_generation=False,
+            )
+        )
+    return outs
+
+
+def _build_metrics_cases_and_mean(
+    *,
+    requests: List[Dict[str, Any]],
+    pre_qualities: List[Dict[str, Any]],
+    post_qualities: List[Dict[str, Any]],
+    edit_time_sec: float,
+    mean_case_id: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    cases: List[Dict[str, Any]] = []
+    for i, (req, pre_q, post_q) in enumerate(zip(requests, pre_qualities, post_qualities)):
+        _locality_outputs_to_acc(pre_quality=pre_q, post_quality=post_q, request=req)
+        cases.append(
+            {
+                "case_id": req.get("case_id", i),
+                "requested_rewrite": req,
+                "time": float(edit_time_sec),
+                "pre": pre_q,
+                "post": post_q,
+            }
+        )
+
+    mean_pre = _mean_metrics_dict([c["pre"] for c in cases])
+    mean_post = _mean_metrics_dict([c["post"] for c in cases])
+    mean_metrics = {
+        "case_id": str(mean_case_id),
+        "time": float(edit_time_sec),
+        "pre": mean_pre,
+        "post": mean_post,
+    }
+    return cases, mean_metrics
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run sample with forward + inverse (rollback) + Butterfly Effect (PPL)."
@@ -206,13 +530,16 @@ def main():
     # ----------------------------
     # Experiment config loading
     # ----------------------------
-    cfg_path = Path(args.config)
+    cfg_path = Path(args.config).expanduser().resolve()
     if not cfg_path.exists():
         raise_path_error("Experiment config file", cfg_path)
 
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
     if not isinstance(cfg, dict):
         raise ValueError(f"Invalid YAML structure (expected mapping) in: {cfg_path}")
+
+    # Persist full experiment config into results.json for reproducibility.
+    results_json["exp_config"] = cfg
 
     method = str(cfg.get("exp_method", "rome")).lower().strip()
     if method not in ("rome", "memit"):
@@ -227,7 +554,12 @@ def main():
     if not exp_hparams_path_raw:
         raise ValueError("Missing exp_hparams_path in experiment config (must point to a separate hparams YAML).")
 
-    exp_hparams_path = _resolve_path_like_cfg(cfg_path, exp_hparams_path_raw)
+    exp_hparams_path_pieces = exp_hparams_path_raw.split("//")
+    exp_hparams_path = ""
+    for piece in exp_hparams_path_pieces:
+        exp_hparams_path += piece.strip()
+    print_color(f"Resolved exp_hparams_path: {exp_hparams_path}", "green")
+    exp_hparams_path = Path(exp_hparams_path)
     if not exp_hparams_path.exists():
         raise_path_error("Hparams config file", exp_hparams_path)
 
@@ -236,19 +568,26 @@ def main():
         raise ValueError(f"Invalid hparams YAML structure (expected mapping) in: {exp_hparams_path}")
     if "alg_name" not in hparams_cfg:
         raise ValueError(f"Hparams YAML must contain 'alg_name'. Missing in: {exp_hparams_path}")
-    
-    # Number of edits to apply in this run (default: MEMIT hparams batch_size, fallback to 1)
-    edit_batch_size = int(hparams_cfg.get("exp_num_edits", 5))
 
+    # Persist raw hparams YAML contents into results.json (before runtime overrides).
+    results_json["hparams_config"] = hparams_cfg
+
+    # ----------------------------
+    # Sample selection + runner params
+    # ----------------------------
+    sample_index = _as_int(cfg.get("exp_sample_index", 0), 0)
     forced_model_name = str(cfg.get("exp_forced_model_name", "gpt2-xl")).strip()
     max_new_tokens = _as_int(cfg.get("exp_max_new_tokens", 20), 20)
     temperature = float(cfg.get("exp_temperature", 1.0) or 1.0)
+    num_edits = _as_int(cfg.get("exp_num_edits", 1), 1)
     do_sample = _as_bool(cfg.get("exp_do_sample", False), False)
     suppress_internal = _as_bool(cfg.get("exp_suppress_internal_prints", True), True)
     verbose = _as_bool(cfg.get("exp_verbose", False), False)
 
     if max_new_tokens <= 0:
         raise ValueError(f"exp_max_new_tokens must be > 0. Got: {max_new_tokens}")
+    if num_edits <= 0:
+        raise ValueError(f"exp_num_edits must be > 0. Got: {num_edits}")
 
     # ----------------------------
     # Butterfly Effect (PPL) config
@@ -277,16 +616,6 @@ def main():
         if be_ppl_max_length <= 0:
             raise ValueError(f"be_ppl_max_length must be > 0 when provided. Got: {be_ppl_max_length_raw}")
 
-    class _Sample:
-        def __init__(self, d: Dict[str, Any]):
-            self.case_id = d.get("case_id", "")
-            self.prompt = d["prompt"]
-            self.subject = d["subject"]
-            self.ground_truth = d["ground_truth"]
-            self.target_new = d["target_new"]
-            self.locality_prompts = d.get("locality_prompts", [])
-            self.portability_prompts = d.get("portability_prompts", [])
-
     # ----------------------------
     # Load dataset records
     # ----------------------------
@@ -303,36 +632,43 @@ def main():
             allow_hf_fallback=allow_hf_fallback,
         )
     else:
-        raw_records, dataset_source = _load_records(cfg_path, cfg)
+        raw_records, dataset_source = _load_records(os.path.join("thesis_experiments", "data"), cfg)
 
-    # Build the list of sample indices to edit (N = edit_batch_size)
-    base_index = _as_int(cfg.get("exp_sample_index", 0), 0)
-    dataset_size = len(raw_records)
+    if not raw_records:
+        raise RuntimeError("No records loaded from dataset (empty list).")
+    if sample_index < 0 or sample_index >= len(raw_records):
+        raise IndexError(f"exp_sample_index={sample_index} out of range. Dataset size={len(raw_records)}")
 
-    # Optional: allow explicit indices from YAML
-    explicit_indices = cfg.get("exp_sample_indices", None)
-    if explicit_indices is not None:
-        # Wrap explicit indices with modulo
-        sample_indices = [int(x) % dataset_size for x in explicit_indices]
-    else:
-        # Default: contiguous block with automatic wrap-around
-        sample_indices = [
-            (base_index + offset) % dataset_size
-            for offset in range(edit_batch_size)
-        ]
-    
+    if method != "memit" and num_edits != 1:
+        raise ValueError(
+            f"exp_method='{method}' does not support batch editing. "
+            "Set exp_num_edits: 1, or use exp_method: 'memit'."
+        )
 
-    
-    # Normalize all records -> build a batch of Samples
-    samples: List[_Sample] = []
-    sample_prompts: List[str] = []
-    for idx in sample_indices:
-        rec_raw = raw_records[idx]
-        rec = _normalize_record(rec_raw, dataset_type)
-        samples.append(_Sample(rec))
-        sample_prompts.append(str(rec["prompt"]).rstrip())
+    batch_start = sample_index
+    batch_end = batch_start + num_edits
+    if batch_end > len(raw_records):
+        raise IndexError(
+            f"Requested exp_num_edits={num_edits} starting at exp_sample_index={sample_index} "
+            f"exceeds dataset size={len(raw_records)} (end_index={batch_end - 1})."
+        )
 
-    
+    batch_indices = list(range(batch_start, batch_end))
+    batch_recs = [_normalize_record(raw_records[i], dataset_type) for i in batch_indices]
+
+    class _Sample:
+        def __init__(self, d: Dict[str, Any]):
+            self.case_id = d.get("case_id", "")
+            self.prompt = d["prompt"]
+            self.subject = d["subject"]
+            self.ground_truth = d["ground_truth"]
+            self.target_new = d["target_new"]
+            self.locality_prompts = d.get("locality_prompts", [])
+            self.portability_prompts = d.get("portability_prompts", [])
+
+    samples = [_Sample(r) for r in batch_recs]
+    probe = samples[0]
+    probe_prompt = str(probe.prompt).rstrip()
 
     # ----------------------------
     # Load hparams + build editor
@@ -351,12 +687,16 @@ def main():
         if hasattr(hparams, attr):
             setattr(hparams, attr, None)
 
+    # Persist effective (runtime) hparams after overrides.
+    results_json["hparams"] = _hparams_to_dict(hparams)
+
     # Ensure stats_dir exists if present in hparams (ROME uses it)
     if hasattr(hparams, "stats_dir"):
         stats_dir = getattr(hparams, "stats_dir")
         if stats_dir in (None, "", "null"):
             raise ValueError("stats_dir in hparams is empty/None. Set stats_dir to a valid folder path in the hparams YAML.")
-        Path(str(stats_dir)).mkdir(parents=True, exist_ok=True)
+        stats_dir_path = _resolve_cfg_path(exp_hparams_path, stats_dir)
+        stats_dir_path.mkdir(parents=True, exist_ok=True)
 
     _log_stats_cache_status(hparams)
 
@@ -364,7 +704,6 @@ def main():
     try:
         log_step("Instantiating BaseEditor and model (may download/load from cache).")
         editor: BaseEditor = BaseEditor.from_hparams(hparams)
-        print_color(f"[DEBUG] Editor class: {editor.__class__.__name__}", "green")
     except RuntimeError as e:
         if _is_cuda_oom(e):
             log_step("Aborted: CUDA OOM while instantiating the model.", "ERROR")
@@ -379,18 +718,41 @@ def main():
     # ----------------------------
     # BE: load PPL texts + choose device
     # ----------------------------
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log_step(f"Selected device: {device}")
+    device = _pick_device_for_tensors(hparams, editor.model)
+    model_parallel = bool(getattr(hparams, "model_parallel", False))
+    has_device_map = hasattr(editor.model, "hf_device_map")
+    log_step(
+        f"Selected device for tensors: {device} "
+        f"(model_parallel={model_parallel}, device_map={'yes' if has_device_map else 'no'})"
+    )
 
-    # Move baseline model once (time-consuming + can OOM)
-    try:
-        log_step("Moving baseline model to device (may take time).")
-        editor.model.to(device)
-    except RuntimeError as e:
-        if _is_cuda_oom(e):
-            log_step("Aborted: CUDA OOM while moving baseline model to device.", "ERROR")
+    def _maybe_move_model_to_device(model, label: str) -> None:
+        if device == "cpu":
             return
-        raise
+        if model_parallel or has_device_map:
+            log_step(f"{label}: model parallel/device_map detected; skipping .to(...) to preserve sharding.", "INFO")
+            return
+        try:
+            cur = str(next(model.parameters()).device)
+        except Exception:
+            cur = None
+        if cur == device:
+            log_step(f"{label}: already on {cur}; skipping .to(...).", "INFO")
+            return
+        try:
+            log_step(f"{label}: moving to {device} (was {cur}).", "INFO")
+            model.to(device)
+        except RuntimeError as e:
+            if _is_cuda_oom(e):
+                log_step(f"Aborted: CUDA OOM while moving {label.lower()} to device.", "ERROR")
+                raise
+            raise
+
+    # Baseline model is usually already placed by BaseEditor; keep this as a safety net.
+    try:
+        _maybe_move_model_to_device(editor.model, "Baseline model")
+    except RuntimeError:
+        return
 
     ppl_texts: List[str] = []
     ppl_m0: Optional[float] = None
@@ -400,7 +762,7 @@ def main():
             log_step("BE enabled but 'be_ppl_data_path' is missing in config YAML.", "ERROR")
             raise ValueError("be_enabled=True but 'be_ppl_data_path' is missing in config YAML.")
 
-        be_ppl_data_path = _resolve_path_like_cfg(cfg_path, be_ppl_data_path_raw)
+        be_ppl_data_path = Path(be_ppl_data_path_raw)
         if not be_ppl_data_path.exists():
             raise_path_error("BE PPL dataset file", be_ppl_data_path)
 
@@ -419,7 +781,11 @@ def main():
     # ----------------------------
     # Print sample summary
     # ----------------------------
-    print("\n=== SAMPLE ===")
+    batch_case_ids = [s.case_id for s in samples]
+    batch_locality_counts = [len(getattr(s, "locality_prompts", []) or []) for s in samples]
+    batch_portability_counts = [len(getattr(s, "portability_prompts", []) or []) for s in samples]
+
+    print("\n=== BATCH ===")
     print(f"method: {method}")
     print(f"dataset_type: {dataset_type}")
     print(f"dataset_source: {dataset_source}")
@@ -430,41 +796,46 @@ def main():
         print(f"hf_split: {cfg.get('hf_split', 'test')}")
         print(f"hf_subset: {cfg.get('hf_subset', None)}")
     print(f"dataset_size_loaded: {len(raw_records)}")
-    print(f"edit_batch_size: {edit_batch_size}")
-    if edit_batch_size == 1:
-        print(f"sample_index: {base_index} (single sample)")
-    else:
-        print(f"sample_indices: {sample_indices} (batch of {edit_batch_size} samples)")
-    
-    for sample in samples:
-        print(f"case_id: {sample.case_id}")
-        print(f"prompt: {sample.prompt}")
-        print(f"subject: {sample.subject}")
-        print(f"ground_truth: {sample.ground_truth}")
-        print(f"target_new: {sample.target_new}")
-        print(f"locality_prompts: {len(sample.locality_prompts)}")
-        print(f"portability_prompts: {len(sample.portability_prompts)}\n")
+    print(f"batch_num_edits: {num_edits}")
+    print(f"batch_indices: {batch_indices}")
+    print(f"batch_case_ids: {batch_case_ids}")
+
+    print("\n--- PROBE SAMPLE (first in batch) ---")
+    print(f"sample_index: {batch_indices[0]}")
+    print(f"case_id: {probe.case_id}")
+    print(f"prompt: {probe_prompt}")
+    print(f"subject: {probe.subject}")
+    print(f"ground_truth: {probe.ground_truth}")
+    print(f"target_new: {probe.target_new}")
+    print(f"locality_prompts: {len(probe.locality_prompts)}")
+    print(f"portability_prompts: {len(probe.portability_prompts)}\n")
 
     # ----------------------------
     # Populate results metadata (for results.json)
     # ----------------------------
-    for sample in samples:
-        i = 0
-        results_json.update({
-            "Case ": i,
-            "method": method,
-            "dataset_type": dataset_type,
-            "dataset_source": dataset_source,
-            "dataset_size_loaded": len(raw_records),
-            "sample_index": sample_indices,
-            "case_id": sample.case_id,
-            "prompt": sample.prompt,
-            "subject": sample.subject,
-            "ground_truth": sample.ground_truth,
-            "target_new": sample.target_new,
-        })
-    results_json["counts"]["locality_prompts"] = len(sample.locality_prompts)
-    results_json["counts"]["portability_prompts"] = len(sample.portability_prompts)
+    results_json.update({
+        "method": method,
+        "dataset_type": dataset_type,
+        "dataset_source": dataset_source,
+        "dataset_size_loaded": len(raw_records),
+        "sample_index": sample_index,
+        "case_id": probe.case_id,
+        "prompt": probe_prompt,
+        "subject": probe.subject,
+        "ground_truth": probe.ground_truth,
+        "target_new": probe.target_new,
+        "batch": {
+            "num_edits": int(num_edits),
+            "indices": batch_indices,
+            "case_ids": batch_case_ids,
+            "counts": {
+                "locality_prompts_per_case": batch_locality_counts,
+                "portability_prompts_per_case": batch_portability_counts,
+            },
+        },
+    })
+    results_json["counts"]["locality_prompts"] = len(probe.locality_prompts)
+    results_json["counts"]["portability_prompts"] = len(probe.portability_prompts)
 
 
     # ----------------------------
@@ -493,390 +864,611 @@ def main():
     # ----------------------------
     # M0: behavioral probe
     # ----------------------------
-    for sample in samples:
-        try:
-            log_step("Behavioral probe (M0).")
-            log_step(f"CASE {sample.case_id} PROMPT: {sample.prompt}")
-            
-            comp = generate_completion(
-                editor.model,
-                tok,
-                sample.prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
+    try:
+        log_step("Behavioral probe (M0) on probe sample.")
+        comp0 = generate_completion(
+            editor.model,
+            tok,
+            probe_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+        )
+        print("\n=== BEHAVIORAL (M0, probe) ===")
+        print(comp0)
+    except RuntimeError as e:
+        if _is_cuda_oom(e):
+            log_step("Aborted: CUDA OOM during behavioral probe (M0).", "ERROR")
+            return
+        raise
+
+    results_json.setdefault("metrics_per_case", {})
+
+    metrics_fwd_mean: Optional[Dict[str, Any]] = None
+    edited_model = None  # M1
+    rollback_model = None  # M2
+
+    # ----------------------------
+    # MEMIT batch path (single algo call per stage)
+    # ----------------------------
+    if method == "memit":
+        fwd_requests = _build_batch_requests(batch_recs, direction="forward")
+        inv_requests = _build_batch_requests(batch_recs, direction="inverse")
+
+        # ----------------------------
+        # Forward edit (M0 -> M1) in ONE batch call
+        # ----------------------------
+        if args.mode in ("forward", "both"):
+            log_step(
+                f"MEMIT batch FORWARD: applying {len(fwd_requests)} edits in one call (GT -> NEW).",
+                "INFO",
             )
-            print("\n=== BEHAVIORAL (M0) ===")
-            print(comp)
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during behavioral probe (M0).", "ERROR")
-                return
-            raise
 
-    metrics_fwd = None
-    metrics_inv = None
-    edited_model = None
-
-    # ----------------------------
-    # Forward edit
-    # ----------------------------
-    if args.mode in ("forward", "both"):
-        log_step("Applying FORWARD edit (GT -> NEW) (time-consuming).")
-
-        extra_eval = {}
-        if isinstance(sample.locality_prompts, list) and sample.locality_prompts:
-            extra_eval["locality_prompts"] = sample.locality_prompts
-        if isinstance(sample.portability_prompts, list) and sample.portability_prompts:
-            extra_eval["portability_prompts"] = sample.portability_prompts
-
-        try:
-            metrics_fwd = []
-            edited_model = None
-
-            for k, s in enumerate(samples):
-                sample_prompt = str(s.prompt).rstrip()
-
-                log_step(f"[BATCH] Forward edit {k+1}/{len(samples)} | idx={sample_indices[k]} | case_id={s.case_id}", "INFO")
-
-                extra_eval = {}
-                if isinstance(s.locality_prompts, list) and s.locality_prompts:
-                    extra_eval["locality_prompts"] = s.locality_prompts
-                if isinstance(s.portability_prompts, list) and s.portability_prompts:
-                    extra_eval["portability_prompts"] = s.portability_prompts
-
-                m_k, edited_model = _call_apply_edit(
-                    editor,
-                    prompt=sample_prompt,
-                    subject=s.subject,
-                    ground_truth=s.ground_truth,
-                    target_new=s.target_new,
-                    verbose=verbose,
-                    suppress_internal_prints=suppress_internal,
-                    **extra_eval,
-                )
-
-                metrics_fwd.append({
-                "sample_index": sample_indices[k],
-                "case_id": s.case_id,
-                "metrics": m_k,
-                })
-
-
-                # IMPORTANT: make edits cumulative by switching the editor's model
-                editor.model = edited_model
-
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during FORWARD edit.", "ERROR")
-                return
-            raise
-
-        results_json["metrics"]["forward"] = metrics_fwd
-
-        # Ensure edited model is on the right device for PPL / generation
-        try:
-            log_step("Moving edited model to device (may take time).")
-            edited_model.to(device)
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM while moving edited model to device.", "ERROR")
-                return
-            raise
-
-        # ----------------------------
-        # BE: PPL on M1 (after forward edit)
-        # ----------------------------
-        if be_enabled and ppl_m0 is not None:
             try:
-                log_step("BE: computing PPL on M1 (after forward edit) (time-consuming).")
-                ppl_m1, _ = compute_ppl(
-                    texts=ppl_texts,
+                pre_q = _eval_quality_per_request(
+                    model=editor.model,
+                    model_name=forced_model_name,
+                    hparams=hparams,
+                    tok=tok,
+                    requests=fwd_requests,
+                )
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during FORWARD pre-evaluation.", "ERROR")
+                    return
+                raise
+
+            try:
+                t_edit = perf_counter()
+                edited_model, _ = editor.apply_algo(
+                    editor.model,
+                    editor.tok,
+                    fwd_requests,
+                    hparams,
+                    copy=False,
+                    return_orig_weights=False,
+                    keep_original_weight=False,
+                )
+                edit_time = perf_counter() - t_edit
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during FORWARD MEMIT batch edit.", "ERROR")
+                    return
+                raise
+
+            try:
+                _maybe_move_model_to_device(edited_model, "Edited model (M1)")
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM while moving edited model to device.", "ERROR")
+                    return
+                raise
+
+            try:
+                post_q = _eval_quality_per_request(
                     model=edited_model,
-                    tokenizer=tok,
-                    device=device,
-                    batch_size=be_ppl_batch_size,
-                    add_start_token=be_ppl_add_start_token,
-                    max_length=be_ppl_max_length,
+                    model_name=forced_model_name,
+                    hparams=hparams,
+                    tok=tok,
+                    requests=fwd_requests,
                 )
-                rep = butterfly_report(ppl_before=ppl_m0, ppl_after=ppl_m1)
-                collapse = is_collapse(
-                    rep,
-                    rel_threshold=be_collapse_rel_threshold,
-                    abs_threshold=be_collapse_abs_threshold,
-                )
-
-                be_fwd = {
-                    "stage": "M1_after_forward",
-                    **rep.to_dict(),
-                    "collapse_rel_threshold": float(be_collapse_rel_threshold),
-                    "collapse_abs_threshold": (float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None),
-                    "is_collapse": bool(collapse),
-                }
-
-                # Keep EasyEdit metrics structure untouched if it's a list.
-                if isinstance(metrics_fwd, dict):
-                    metrics_fwd["butterfly_effect"] = be_fwd
-                else:
-                    log_step("Forward metrics is a list; BE report kept separate (not injected).", "WARNING")
-
-                print(
-                    "\n=== BE (M1) ===\n"
-                    f"mean_ppl: {ppl_m1:.4f}\n"
-                    f"delta_abs: {rep.ppl_delta_abs:.4f}\n"
-                    f"delta_rel: {rep.ppl_delta_rel:.4f}\n"
-                    f"is_collapse: {collapse}"
-                )
-
-                results_json["ppl"]["M1"] = float(ppl_m1)
-                results_json["be_report"]["M1"] = {
-                    **rep.to_dict(),
-                    "is_collapse": bool(collapse),
-                    "collapse_rel_threshold": float(be_collapse_rel_threshold),
-                    "collapse_abs_threshold": (float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None),
-                }
             except RuntimeError as e:
                 if _is_cuda_oom(e):
-                    log_step("Aborted: CUDA OOM while computing PPL on M1.", "ERROR")
+                    log_step("Aborted: CUDA OOM during FORWARD post-evaluation.", "ERROR")
                     return
                 raise
 
-        print_metrics_table(metrics_fwd, title="FORWARD METRICS")
-
-        # Behavioral probe on edited model
-        try:
-            log_step("Behavioral probe (M1).")
-            comp1 = generate_completion(
-                edited_model,
-                tok,
-                sample_prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
+            fwd_cases, metrics_fwd_mean = _build_metrics_cases_and_mean(
+                requests=fwd_requests,
+                pre_qualities=pre_q,
+                post_qualities=post_q,
+                edit_time_sec=edit_time,
+                mean_case_id=f"mean_n={len(fwd_requests)}",
             )
-            print("\n=== BEHAVIORAL (M1) ===")
-            print(comp1)
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during behavioral probe (M1).", "ERROR")
-                return
-            raise
 
-    # ----------------------------
-    # Inverse only
-    # ----------------------------
-    if args.mode == "inverse":
-        log_step("Applying INVERSE edit only (NEW -> GT) on M0 (time-consuming).")
+            results_json["metrics"]["forward"] = metrics_fwd_mean
+            results_json["metrics_per_case"]["forward"] = fwd_cases
 
-        extra_eval = {}
-        if isinstance(sample.locality_prompts, list) and sample.locality_prompts:
-            extra_eval["locality_prompts"] = sample.locality_prompts
-        if isinstance(sample.portability_prompts, list) and sample.portability_prompts:
-            extra_eval["portability_prompts"] = sample.portability_prompts
+            print_metrics_table(metrics_fwd_mean, title="FORWARD METRICS (MEAN)")
 
-        try:
-            metrics_inv = []
-            rollback_model = None
+            # ----------------------------
+            # BE: PPL on M1 (after forward edit)
+            # ----------------------------
+            if be_enabled and ppl_m0 is not None:
+                try:
+                    log_step("BE: computing PPL on M1 (after forward edit) (time-consuming).")
+                    ppl_m1, _ = compute_ppl(
+                        texts=ppl_texts,
+                        model=edited_model,
+                        tokenizer=tok,
+                        device=device,
+                        batch_size=be_ppl_batch_size,
+                        add_start_token=be_ppl_add_start_token,
+                        max_length=be_ppl_max_length,
+                    )
+                    rep = butterfly_report(ppl_before=ppl_m0, ppl_after=ppl_m1)
+                    collapse = is_collapse(
+                        rep,
+                        rel_threshold=be_collapse_rel_threshold,
+                        abs_threshold=be_collapse_abs_threshold,
+                    )
 
-            # IMPORTANT: rollback must be applied in reverse order to undo cumulative edits
-            for k, s in enumerate(reversed(samples)):
-                idx = sample_indices[len(samples) - 1 - k]
-                sample_prompt = str(s.prompt).rstrip()
+                    print(
+                        "\n=== BE (M1) ===\n"
+                        f"mean_ppl: {ppl_m1:.4f}\n"
+                        f"delta_abs: {rep.ppl_delta_abs:.4f}\n"
+                        f"delta_rel: {rep.ppl_delta_rel:.4f}\n"
+                        f"is_collapse: {collapse}"
+                    )
 
-                log_step(
-                    f"[BATCH] Rollback edit {k+1}/{len(samples)} | idx={idx} | case_id={s.case_id}",
-                    "INFO",
+                    results_json["ppl"]["M1"] = float(ppl_m1)
+                    results_json["be_report"]["M1"] = {
+                        **rep.to_dict(),
+                        "is_collapse": bool(collapse),
+                        "collapse_rel_threshold": float(be_collapse_rel_threshold),
+                        "collapse_abs_threshold": (
+                            float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None
+                        ),
+                    }
+                except RuntimeError as e:
+                    if _is_cuda_oom(e):
+                        log_step("Aborted: CUDA OOM while computing PPL on M1.", "ERROR")
+                        return
+                    raise
+
+            # Behavioral probe on edited model (probe sample)
+            try:
+                log_step("Behavioral probe (M1) on probe sample.")
+                comp1 = generate_completion(
+                    edited_model,
+                    tok,
+                    probe_prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=do_sample,
                 )
+                print("\n=== BEHAVIORAL (M1, probe) ===")
+                print(comp1)
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during behavioral probe (M1).", "ERROR")
+                    return
+                raise
 
-                extra_eval = {}
-                if isinstance(s.locality_prompts, list) and s.locality_prompts:
-                    extra_eval["locality_prompts"] = s.locality_prompts
-                if isinstance(s.portability_prompts, list) and s.portability_prompts:
-                    extra_eval["portability_prompts"] = s.portability_prompts
+        # ----------------------------
+        # Inverse only (M0 -> M1) in ONE batch call
+        # ----------------------------
+        if args.mode == "inverse":
+            log_step(
+                f"MEMIT batch INVERSE-only: applying {len(inv_requests)} edits in one call (NEW -> GT).",
+                "INFO",
+            )
+            try:
+                pre_q = _eval_quality_per_request(
+                    model=editor.model,
+                    model_name=forced_model_name,
+                    hparams=hparams,
+                    tok=tok,
+                    requests=inv_requests,
+                )
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during INVERSE-only pre-evaluation.", "ERROR")
+                    return
+                raise
 
-                # INVERSE edit: swap GT and NEW (rollback: NEW -> GT)
-                m_k, inv_model = _call_apply_edit(
+            try:
+                t_edit = perf_counter()
+                inv_model, _ = editor.apply_algo(
+                    editor.model,
+                    editor.tok,
+                    inv_requests,
+                    hparams,
+                    copy=False,
+                    return_orig_weights=False,
+                    keep_original_weight=False,
+                )
+                edit_time = perf_counter() - t_edit
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during INVERSE-only MEMIT batch edit.", "ERROR")
+                    return
+                raise
+
+            try:
+                _maybe_move_model_to_device(inv_model, "Inverse-only model")
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM while moving inverse-only model to device.", "ERROR")
+                    return
+                raise
+
+            try:
+                post_q = _eval_quality_per_request(
+                    model=inv_model,
+                    model_name=forced_model_name,
+                    hparams=hparams,
+                    tok=tok,
+                    requests=inv_requests,
+                )
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during INVERSE-only post-evaluation.", "ERROR")
+                    return
+                raise
+
+            inv_cases, metrics_inv_mean = _build_metrics_cases_and_mean(
+                requests=inv_requests,
+                pre_qualities=pre_q,
+                post_qualities=post_q,
+                edit_time_sec=edit_time,
+                mean_case_id=f"mean_n={len(inv_requests)}",
+            )
+            results_json["metrics"]["inverse_only"] = metrics_inv_mean
+            results_json["metrics_per_case"]["inverse_only"] = inv_cases
+            print_metrics_table(metrics_inv_mean, title="INVERSE METRICS (MEAN)")
+
+            try:
+                log_step("Behavioral probe (after inverse-only) on probe sample.")
+                comp2 = generate_completion(
+                    inv_model,
+                    tok,
+                    probe_prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                )
+                print("\n=== BEHAVIORAL (after inverse-only, probe) ===")
+                print(comp2)
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during behavioral probe (inverse-only).", "ERROR")
+                    return
+                raise
+
+        # ----------------------------
+        # Both: rollback (M1 -> M2) in ONE batch call
+        # ----------------------------
+        if args.mode == "both":
+            if edited_model is None:
+                raise RuntimeError("edited_model is None. Forward edit did not run, cannot perform rollback.")
+
+            log_step(
+                f"MEMIT batch ROLLBACK: applying {len(inv_requests)} edits in one call (NEW -> GT) on M1.",
+                "INFO",
+            )
+            try:
+                pre_q = _eval_quality_per_request(
+                    model=edited_model,
+                    model_name=forced_model_name,
+                    hparams=hparams,
+                    tok=tok,
+                    requests=inv_requests,
+                )
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during ROLLBACK pre-evaluation.", "ERROR")
+                    return
+                raise
+
+            try:
+                t_edit = perf_counter()
+                rollback_model, _ = editor.apply_algo(
+                    editor.model,
+                    editor.tok,
+                    inv_requests,
+                    hparams,
+                    copy=False,
+                    return_orig_weights=False,
+                    keep_original_weight=False,
+                )
+                edit_time = perf_counter() - t_edit
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during ROLLBACK MEMIT batch edit.", "ERROR")
+                    return
+                raise
+
+            try:
+                _maybe_move_model_to_device(rollback_model, "Rollback model (M2)")
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM while moving rollback model to device.", "ERROR")
+                    return
+                raise
+
+            try:
+                post_q = _eval_quality_per_request(
+                    model=rollback_model,
+                    model_name=forced_model_name,
+                    hparams=hparams,
+                    tok=tok,
+                    requests=inv_requests,
+                )
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during ROLLBACK post-evaluation.", "ERROR")
+                    return
+                raise
+
+            rb_cases, metrics_rb_mean = _build_metrics_cases_and_mean(
+                requests=inv_requests,
+                pre_qualities=pre_q,
+                post_qualities=post_q,
+                edit_time_sec=edit_time,
+                mean_case_id=f"mean_n={len(inv_requests)}",
+            )
+            results_json["metrics"]["rollback"] = metrics_rb_mean
+            results_json["metrics_per_case"]["rollback"] = rb_cases
+
+            # ----------------------------
+            # BE: PPL on M2 (after rollback)
+            # ----------------------------
+            if be_enabled and ppl_m0 is not None:
+                try:
+                    log_step("BE: computing PPL on M2 (after rollback) (time-consuming).")
+                    ppl_m2, _ = compute_ppl(
+                        texts=ppl_texts,
+                        model=rollback_model,
+                        tokenizer=tok,
+                        device=device,
+                        batch_size=be_ppl_batch_size,
+                        add_start_token=be_ppl_add_start_token,
+                        max_length=be_ppl_max_length,
+                    )
+                    rep2 = butterfly_report(ppl_before=ppl_m0, ppl_after=ppl_m2)
+                    collapse2 = is_collapse(
+                        rep2,
+                        rel_threshold=be_collapse_rel_threshold,
+                        abs_threshold=be_collapse_abs_threshold,
+                    )
+
+                    print(
+                        "\n=== BE (M2) ===\n"
+                        f"mean_ppl: {ppl_m2:.4f}\n"
+                        f"delta_abs: {rep2.ppl_delta_abs:.4f}\n"
+                        f"delta_rel: {rep2.ppl_delta_rel:.4f}\n"
+                        f"is_collapse: {collapse2}"
+                    )
+
+                    results_json["ppl"]["M2"] = float(ppl_m2)
+                    results_json["be_report"]["M2"] = {
+                        **rep2.to_dict(),
+                        "is_collapse": bool(collapse2),
+                        "collapse_rel_threshold": float(be_collapse_rel_threshold),
+                        "collapse_abs_threshold": (
+                            float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None
+                        ),
+                    }
+                except RuntimeError as e:
+                    if _is_cuda_oom(e):
+                        log_step("Aborted: CUDA OOM while computing PPL on M2.", "ERROR")
+                        return
+                    raise
+
+            print_metrics_table(metrics_rb_mean, title="INVERSE (ROLLBACK) METRICS (MEAN)")
+
+            try:
+                log_step("Behavioral probe (M2) on probe sample.")
+                comp2 = generate_completion(
+                    rollback_model,
+                    tok,
+                    probe_prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    do_sample=do_sample,
+                )
+                print("\n=== BEHAVIORAL (M2, probe) ===")
+                print(comp2)
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during behavioral probe (M2).", "ERROR")
+                    return
+                raise
+
+    # ----------------------------
+    # ROME single-edit fallback (first sample only)
+    # ----------------------------
+    else:
+        if args.mode in ("forward", "both"):
+            log_step("Applying FORWARD edit (GT -> NEW) on probe sample (ROME single-edit).")
+
+            extra_eval = {}
+            if isinstance(probe.locality_prompts, list) and probe.locality_prompts:
+                extra_eval["locality_prompts"] = probe.locality_prompts
+            if isinstance(probe.portability_prompts, list) and probe.portability_prompts:
+                extra_eval["portability_prompts"] = probe.portability_prompts
+
+            try:
+                metrics_fwd, edited_model = _call_apply_edit(
                     editor,
-                    prompt=sample_prompt,
-                    subject=s.subject,
-                    ground_truth=s.target_new,  # was NEW in forward
-                    target_new=s.ground_truth,  # restore GT
+                    prompt=probe_prompt,
+                    subject=probe.subject,
+                    ground_truth=probe.ground_truth,
+                    target_new=probe.target_new,
                     verbose=verbose,
                     suppress_internal_prints=suppress_internal,
                     **extra_eval,
                 )
-
-                metrics_inv.append({
-                "sample_index": sample_indices[k],
-                "case_id": s.case_id,
-                "metrics": m_k,
-                })
-
-
-                # IMPORTANT: keep rollback cumulative by switching the editor's model
-                editor.model = inv_model
-                # Inversion of cumulative edits must be applied in reverse order to properly undo them, 
-                # but metrics are collected in forward order for easier interpretation 
-                # (first item corresponds to first edit, etc). We'll reverse the metrics list at the end to match the order of edits.
-                metrics_inv = list(reversed(metrics_inv))
-
-
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during inverse-only edit.", "ERROR")
-                return
-            raise
-
-        results_json["metrics"]["inverse_only"] = metrics_inv
-        print_metrics_table(metrics_inv, title="INVERSE METRICS")
-
-        try:
-            log_step("Behavioral probe (after inverse-only).")
-            comp2 = generate_completion(
-                inv_model,
-                tok,
-                sample_prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-            )
-            print("\n=== BEHAVIORAL (after inverse-only) ===")
-            print(comp2)
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during behavioral probe (inverse-only).", "ERROR")
-                return
-            raise
-
-    # ----------------------------
-    # Both: rollback
-    # ----------------------------
-    if args.mode == "both":
-        if edited_model is None:
-            raise RuntimeError("edited_model is None. Forward edit did not run, cannot perform rollback.")
-
-        log_step("Switching editor to edited model for rollback.")
-        editor.model = edited_model
-
-        log_step("Applying INVERSE edit (rollback: NEW -> GT) on M1 (time-consuming).")
-
-        extra_eval = {}
-        if isinstance(sample.locality_prompts, list) and sample.locality_prompts:
-            extra_eval["locality_prompts"] = sample.locality_prompts
-        if isinstance(sample.portability_prompts, list) and sample.portability_prompts:
-            extra_eval["portability_prompts"] = sample.portability_prompts
-
-        try:
-            metrics_inv, rollback_model = _call_apply_edit(
-                editor,
-                prompt=sample_prompt,
-                subject=sample.subject,
-                ground_truth=sample.target_new,
-                target_new=sample.ground_truth,
-                verbose=verbose,
-                suppress_internal_prints=suppress_internal,
-                **extra_eval,
-            )
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during rollback edit.", "ERROR")
-                return
-            raise
-
-        results_json["metrics"]["rollback"] = metrics_inv
-
-        # Ensure rollback model is on the right device
-        try:
-            log_step("Moving rollback model to device (may take time).")
-            rollback_model.to(device)
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM while moving rollback model to device.", "ERROR")
-                return
-            raise
-
-        # ----------------------------
-        # BE: PPL on M2 (after rollback)
-        # ----------------------------
-        if be_enabled and ppl_m0 is not None:
-            try:
-                log_step("BE: computing PPL on M2 (after rollback) (time-consuming).")
-                ppl_m2, _ = compute_ppl(
-                    texts=ppl_texts,
-                    model=rollback_model,
-                    tokenizer=tok,
-                    device=device,
-                    batch_size=be_ppl_batch_size,
-                    add_start_token=be_ppl_add_start_token,
-                    max_length=be_ppl_max_length,
-                )
-                rep2 = butterfly_report(ppl_before=ppl_m0, ppl_after=ppl_m2)
-                collapse2 = is_collapse(
-                    rep2,
-                    rel_threshold=be_collapse_rel_threshold,
-                    abs_threshold=be_collapse_abs_threshold,
-                )
-
-                be_inv = {
-                    "stage": "M2_after_rollback",
-                    **rep2.to_dict(),
-                    "collapse_rel_threshold": float(be_collapse_rel_threshold),
-                    "collapse_abs_threshold": (float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None),
-                    "is_collapse": bool(collapse2),
-                }
-
-                if isinstance(metrics_inv, dict):
-                    metrics_inv["butterfly_effect"] = be_inv
-                else:
-                    log_step("Rollback metrics is a list; BE report kept separate (not injected).", "WARNING")
-
-                print(
-                    "\n=== BE (M2) ===\n"
-                    f"mean_ppl: {ppl_m2:.4f}\n"
-                    f"delta_abs: {rep2.ppl_delta_abs:.4f}\n"
-                    f"delta_rel: {rep2.ppl_delta_rel:.4f}\n"
-                    f"is_collapse: {collapse2}"
-                )
-
-                results_json["ppl"]["M2"] = float(ppl_m2)
-                results_json["be_report"]["M2"] = {
-                    **rep2.to_dict(),
-                    "is_collapse": bool(collapse2),
-                    "collapse_rel_threshold": float(be_collapse_rel_threshold),
-                    "collapse_abs_threshold": (float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None),
-                }
             except RuntimeError as e:
                 if _is_cuda_oom(e):
-                    log_step("Aborted: CUDA OOM while computing PPL on M2.", "ERROR")
+                    log_step("Aborted: CUDA OOM during FORWARD edit.", "ERROR")
                     return
                 raise
 
-        print_metrics_table(metrics_inv, title="INVERSE (ROLLBACK) METRICS")
+            results_json["metrics"]["forward"] = metrics_fwd
 
-        try:
-            log_step("Behavioral probe (M2).")
-            comp2 = generate_completion(
-                rollback_model,
-                tok,
-                sample_prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-            )
-            print("\n=== BEHAVIORAL (M2) ===")
-            print(comp2)
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during behavioral probe (M2).", "ERROR")
-                return
-            raise
+            try:
+                _maybe_move_model_to_device(edited_model, "Edited model (M1)")
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM while moving edited model to device.", "ERROR")
+                    return
+                raise
+
+            if be_enabled and ppl_m0 is not None:
+                try:
+                    log_step("BE: computing PPL on M1 (after forward edit) (time-consuming).")
+                    ppl_m1, _ = compute_ppl(
+                        texts=ppl_texts,
+                        model=edited_model,
+                        tokenizer=tok,
+                        device=device,
+                        batch_size=be_ppl_batch_size,
+                        add_start_token=be_ppl_add_start_token,
+                        max_length=be_ppl_max_length,
+                    )
+                    rep = butterfly_report(ppl_before=ppl_m0, ppl_after=ppl_m1)
+                    collapse = is_collapse(
+                        rep,
+                        rel_threshold=be_collapse_rel_threshold,
+                        abs_threshold=be_collapse_abs_threshold,
+                    )
+                    print(
+                        "\n=== BE (M1) ===\n"
+                        f"mean_ppl: {ppl_m1:.4f}\n"
+                        f"delta_abs: {rep.ppl_delta_abs:.4f}\n"
+                        f"delta_rel: {rep.ppl_delta_rel:.4f}\n"
+                        f"is_collapse: {collapse}"
+                    )
+                    results_json["ppl"]["M1"] = float(ppl_m1)
+                    results_json["be_report"]["M1"] = {
+                        **rep.to_dict(),
+                        "is_collapse": bool(collapse),
+                        "collapse_rel_threshold": float(be_collapse_rel_threshold),
+                        "collapse_abs_threshold": (
+                            float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None
+                        ),
+                    }
+                except RuntimeError as e:
+                    if _is_cuda_oom(e):
+                        log_step("Aborted: CUDA OOM while computing PPL on M1.", "ERROR")
+                        return
+                    raise
+
+            print_metrics_table(metrics_fwd, title="FORWARD METRICS")
+
+        if args.mode == "inverse":
+            log_step("Applying INVERSE edit only (NEW -> GT) on probe sample (ROME single-edit).")
+
+            extra_eval = {}
+            if isinstance(probe.locality_prompts, list) and probe.locality_prompts:
+                extra_eval["locality_prompts"] = probe.locality_prompts
+            if isinstance(probe.portability_prompts, list) and probe.portability_prompts:
+                extra_eval["portability_prompts"] = probe.portability_prompts
+
+            try:
+                metrics_inv, inv_model = _call_apply_edit(
+                    editor,
+                    prompt=probe_prompt,
+                    subject=probe.subject,
+                    ground_truth=probe.target_new,
+                    target_new=probe.ground_truth,
+                    verbose=verbose,
+                    suppress_internal_prints=suppress_internal,
+                    **extra_eval,
+                )
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during inverse-only edit.", "ERROR")
+                    return
+                raise
+
+            results_json["metrics"]["inverse_only"] = metrics_inv
+            print_metrics_table(metrics_inv, title="INVERSE METRICS")
+
+        if args.mode == "both":
+            if edited_model is None:
+                raise RuntimeError("edited_model is None. Forward edit did not run, cannot perform rollback.")
+
+            log_step("Switching editor to edited model for rollback (ROME single-edit).")
+            editor.model = edited_model
+
+            log_step("Applying INVERSE edit (rollback: NEW -> GT) on probe sample (ROME single-edit).")
+
+            extra_eval = {}
+            if isinstance(probe.locality_prompts, list) and probe.locality_prompts:
+                extra_eval["locality_prompts"] = probe.locality_prompts
+            if isinstance(probe.portability_prompts, list) and probe.portability_prompts:
+                extra_eval["portability_prompts"] = probe.portability_prompts
+
+            try:
+                metrics_inv, rollback_model = _call_apply_edit(
+                    editor,
+                    prompt=probe_prompt,
+                    subject=probe.subject,
+                    ground_truth=probe.target_new,
+                    target_new=probe.ground_truth,
+                    verbose=verbose,
+                    suppress_internal_prints=suppress_internal,
+                    **extra_eval,
+                )
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM during rollback edit.", "ERROR")
+                    return
+                raise
+
+            results_json["metrics"]["rollback"] = metrics_inv
+
+            try:
+                _maybe_move_model_to_device(rollback_model, "Rollback model (M2)")
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM while moving rollback model to device.", "ERROR")
+                    return
+                raise
+
+            if be_enabled and ppl_m0 is not None:
+                try:
+                    log_step("BE: computing PPL on M2 (after rollback) (time-consuming).")
+                    ppl_m2, _ = compute_ppl(
+                        texts=ppl_texts,
+                        model=rollback_model,
+                        tokenizer=tok,
+                        device=device,
+                        batch_size=be_ppl_batch_size,
+                        add_start_token=be_ppl_add_start_token,
+                        max_length=be_ppl_max_length,
+                    )
+                    rep2 = butterfly_report(ppl_before=ppl_m0, ppl_after=ppl_m2)
+                    collapse2 = is_collapse(
+                        rep2,
+                        rel_threshold=be_collapse_rel_threshold,
+                        abs_threshold=be_collapse_abs_threshold,
+                    )
+                    print(
+                        "\n=== BE (M2) ===\n"
+                        f"mean_ppl: {ppl_m2:.4f}\n"
+                        f"delta_abs: {rep2.ppl_delta_abs:.4f}\n"
+                        f"delta_rel: {rep2.ppl_delta_rel:.4f}\n"
+                        f"is_collapse: {collapse2}"
+                    )
+                    results_json["ppl"]["M2"] = float(ppl_m2)
+                    results_json["be_report"]["M2"] = {
+                        **rep2.to_dict(),
+                        "is_collapse": bool(collapse2),
+                        "collapse_rel_threshold": float(be_collapse_rel_threshold),
+                        "collapse_abs_threshold": (
+                            float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None
+                        ),
+                    }
+                except RuntimeError as e:
+                    if _is_cuda_oom(e):
+                        log_step("Aborted: CUDA OOM while computing PPL on M2.", "ERROR")
+                        return
+                    raise
+
+            print_metrics_table(metrics_inv, title="INVERSE (ROLLBACK) METRICS")
 
     # ----------------------------
     # Finalize + persist results.json ONLY after everything is computed
     # ----------------------------
     results_json["elapsed_sec"] = float(perf_counter() - t0)
-    save_results_json( results_json, path="logs/logs-" + startTime+"/results.json")
-    log_step(f"Saved metrics JSON to logs/logs-{startTime}/results.json (elapsed_sec={results_json['elapsed_sec']:.3f}).", "INFO")
+    logs_dir = Path("logs") / f"logs-{startTime}"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    save_results_json(results_json, path=logs_dir / "results.json")
+    log_step(f"Saved metrics JSON to {logs_dir / 'results.json'} (elapsed_sec={results_json['elapsed_sec']:.3f}).", "INFO")
 
 if __name__ == "__main__":
     main()
