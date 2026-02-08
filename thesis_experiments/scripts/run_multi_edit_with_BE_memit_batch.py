@@ -1,7 +1,44 @@
+from thesis_experiments.scripts.utils_io import (
+    raise_path_error,
+    _load_records,
+    _normalize_record,
+    _as_str,
+    _as_int,
+    _as_bool,
+    save_results_json,
+    _is_cuda_oom,
+    _log_stats_cache_status,
+    log_step,
+    set_start_time
+)
+
+from thesis_experiments.scripts.pretty_print_utilities import (
+    print_metrics_table,
+    print_hparams_table,
+    print_color,
+)
+
+from thesis_experiments.scripts.butterfly_effect_ppl import (
+    load_ppl_texts_from_json,
+    compute_ppl,
+    butterfly_report,
+    is_collapse,
+)
+
+from ke_core import (
+    load_hparams,
+    force_hf_home,
+    get_tokenizer,
+    generate_completion,
+    apply_edit,
+)
+
+from easyeditor import BaseEditor
+from easyeditor.editors.utils import _prepare_requests
+from easyeditor.evaluate import compute_edit_quality
 from time import perf_counter
 from datetime import datetime
 import json
-import sys
 import inspect
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -46,46 +83,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*deprecated.*")
 warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 
-from thesis_experiments.scripts.utils_io import (
-    print_log,
-    _resolve_path_like_cfg,
-    raise_path_error,
-    _load_records,
-    _normalize_record,
-    _as_str,
-    _as_int,
-    _as_bool,
-    save_results_json,
-    _is_cuda_oom,
-    _log_stats_cache_status,
-    log_step,
-    set_start_time
-)
-
-from thesis_experiments.scripts.pretty_print_utilities import (
-    print_metrics_table,
-    print_hparams_table,
-    print_color,
-)
-
-from thesis_experiments.scripts.butterfly_effect_ppl import (
-    load_ppl_texts_from_json,
-    compute_ppl,
-    butterfly_report,
-    is_collapse,
-)
-
-from ke_core import (
-    load_hparams,
-    force_hf_home,
-    get_tokenizer,
-    generate_completion,
-    apply_edit,
-)
-
-from easyeditor import BaseEditor
-from easyeditor.editors.utils import _prepare_requests
-from easyeditor.evaluate import compute_edit_quality
 startTime = str(datetime.now().isoformat()).replace(":", "")
 set_start_time(startTime)
 
