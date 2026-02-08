@@ -140,6 +140,14 @@ class BaseEditor:
         if hparams.model_parallel: 
             hparams.device = str(self.model.device).split(":")[1]
         if not hparams.model_parallel and hasattr(hparams, 'device') and hparams.alg_name != 'QLoRA':
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA requested (hparams.device is set) but torch.cuda.is_available() is False. "
+                    f"torch={torch.__version__}, torch.version.cuda={getattr(torch.version, 'cuda', None)}. "
+                    "This is almost always an NVIDIA driver / CUDA runtime mismatch or GPU not being exposed "
+                    "(e.g. running on a node without GPU, inside a container without `--gpus`, or with an invalid "
+                    "CUDA_VISIBLE_DEVICES)."
+                )
             self.model.to(f'cuda:{hparams.device}')
 
         self.hparams = hparams
@@ -637,5 +645,4 @@ class BaseEditor:
     ):
         metrics = self.apply_algo(datasets, self.hparams)
         return metrics
-
 

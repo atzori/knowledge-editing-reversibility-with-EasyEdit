@@ -42,6 +42,7 @@ class MEMITHyperParams(HyperParams):
     max_length: int = 40
     batch_size: int = 1
     model_parallel: bool = False
+    fp16: bool = False
 
     @classmethod
     def from_hparams(cls, hparams_name_or_path: str):

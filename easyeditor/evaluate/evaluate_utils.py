@@ -175,7 +175,10 @@ def test_batch_prediction_acc(model, tok, hparams, prompts, target, device, loca
     ).to(f"cuda:{device}")
 
     with torch.no_grad():
-        outputs = model(**prompt_tok)
+        try:
+            outputs = model(**prompt_tok, use_cache=False)
+        except TypeError:
+            outputs = model(**prompt_tok)
         if type(outputs) is torch.Tensor:
             logits = outputs
         else:
@@ -219,7 +222,10 @@ def test_seq2seq_batch_prediction_acc(model, tok, hparams, prompts, targets, dev
     prompt_tok['decoder_attention_mask'] = trg_tok['attention_mask']
 
     with torch.no_grad():
-        outputs = model(**prompt_tok)
+        try:
+            outputs = model(**prompt_tok, use_cache=False)
+        except TypeError:
+            outputs = model(**prompt_tok)
         if type(outputs) is torch.Tensor:
             logits = outputs
         else:
@@ -287,7 +293,10 @@ def test_prediction_acc(model, tok, hparams, prompts, targets, device, locality=
     num_pad_toks = [int((i == tok.pad_token_id).sum()) for i in prompt_target_tok['input_ids'].cpu()]
     prompt_len = [x+y for x,y in zip(num_pad_toks,num_prompt_toks)]
     with torch.no_grad():
-        outputs = model(**prompt_target_tok)
+        try:
+            outputs = model(**prompt_target_tok, use_cache=False)
+        except TypeError:
+            outputs = model(**prompt_target_tok)
         if type(outputs) is torch.Tensor:
             logits = outputs
         else:
@@ -689,7 +698,10 @@ def F1(model, tok, hparams, prompts, targets, device, locality=False, vanilla_ge
     num_pad_toks = [int((i == tok.pad_token_id).sum()) for i in prompt_target_tok['input_ids'].cpu()]
     prompt_len = [x+y for x,y in zip(num_pad_toks,num_prompt_toks)]
     with torch.no_grad():
-        outputs = model(**prompt_target_tok)
+        try:
+            outputs = model(**prompt_target_tok, use_cache=False)
+        except TypeError:
+            outputs = model(**prompt_target_tok)
         if type(outputs) is torch.Tensor:
             logits = outputs
         else:

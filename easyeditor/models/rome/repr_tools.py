@@ -164,7 +164,10 @@ def get_reprs_at_idxs(
                 retain_input=tin,
                 retain_output=tout,
             ) as tr:
-                model(**contexts_tok)
+                try:
+                    model(**contexts_tok, use_cache=False)
+                except TypeError:
+                    model(**contexts_tok)
 
         if tin:
             _process(tr.input, batch_idxs, "in")
