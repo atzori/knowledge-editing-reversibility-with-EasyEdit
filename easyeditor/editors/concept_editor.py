@@ -58,7 +58,7 @@ class ConceptEditor:
             phparams.model_name = prompt_hparams['model_name']
             phparams.device = prompt_hparams['device']
             phparams.max_length = 40
-            phparams.model_parallel = False
+            phparams.model_parallel = True
             return cls(phparams)
         return cls(hparams)
     
