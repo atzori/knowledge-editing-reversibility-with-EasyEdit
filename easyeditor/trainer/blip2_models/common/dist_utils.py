@@ -8,6 +8,15 @@
 import datetime
 import functools
 import os
+import warnings
+
+
+# ----------------------------
+# Clean warnings
+# ----------------------------
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*deprecated.*")
+warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 
 import torch
 import torch.distributed as dist

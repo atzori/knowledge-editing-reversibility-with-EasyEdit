@@ -297,6 +297,9 @@ def main():
     do_sample = _as_bool(cfg.get("exp_do_sample", False), False)
     suppress_internal = _as_bool(cfg.get("exp_suppress_internal_prints", True), True)
     verbose = _as_bool(cfg.get("exp_verbose", False), False)
+    model_parallel_override = cfg.get("model_parallel", None)
+    if model_parallel_override is not None:
+        model_parallel_override = _as_bool(model_parallel_override, False)
 
     if max_new_tokens <= 0:
         raise ValueError(f"exp_max_new_tokens must be > 0. Got: {max_new_tokens}")
@@ -376,6 +379,12 @@ def main():
     force_hf_home()
     hparams = load_hparams(method, str(exp_hparams_path))
 
+    # Runner-level override: honor `model_parallel` from experiment config.
+    # This controls EasyEdit's HF `device_map` selection inside BaseEditor.
+    if model_parallel_override is not None:
+        hparams.model_parallel = bool(model_parallel_override)
+        log_step(f"Override: model_parallel={hparams.model_parallel} (from exp config).", "INFO")
+
     # Force model_name to avoid local-cache weirdness
     hparams.model_name = forced_model_name
 
@@ -415,18 +424,65 @@ def main():
     # ----------------------------
     # BE: load PPL texts + choose device
     # ----------------------------
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    log_step(f"Selected device: {device}")
+    def _pick_device_for_tensors(hparams_obj: Any, model: Any) -> str:
+        """
+        Pick a device string for input tensors / eval loops.
 
-    # Move baseline model once (time-consuming + can OOM)
-    try:
-        log_step("Moving baseline model to device (may take time).")
-        editor.model.to(device)
-    except RuntimeError as e:
-        if _is_cuda_oom(e):
-            log_step("Aborted: CUDA OOM while moving baseline model to device.", "ERROR")
+        - If model parallel (HF device_map), inputs should go to the model's first parameter device.
+        - Otherwise, prefer hparams.device (e.g. cuda:1) to avoid accidental moves to cuda:0.
+        """
+        if not torch.cuda.is_available():
+            return "cpu"
+
+        model_parallel = bool(getattr(hparams_obj, "model_parallel", False))
+        has_device_map = hasattr(model, "hf_device_map")
+
+        if model_parallel or has_device_map:
+            try:
+                return str(next(model.parameters()).device)
+            except Exception:
+                return "cuda"
+
+        dev = getattr(hparams_obj, "device", None)
+        if dev is None or str(dev) == "-1":
+            return "cuda"
+        return f"cuda:{dev}"
+
+    device = _pick_device_for_tensors(hparams, editor.model)
+    model_parallel = bool(getattr(hparams, "model_parallel", False))
+    has_device_map = hasattr(editor.model, "hf_device_map")
+    log_step(
+        f"Selected device for tensors: {device} "
+        f"(model_parallel={model_parallel}, device_map={'yes' if has_device_map else 'no'})"
+    )
+
+    def _maybe_move_model_to_device(model, label: str) -> None:
+        if device == "cpu":
             return
-        raise
+        if model_parallel or has_device_map:
+            log_step(f"{label}: model parallel/device_map detected; skipping .to(...) to preserve sharding.", "INFO")
+            return
+        try:
+            cur = str(next(model.parameters()).device)
+        except Exception:
+            cur = None
+        if cur == device:
+            log_step(f"{label}: already on {cur}; skipping .to(...).", "INFO")
+            return
+        try:
+            log_step(f"{label}: moving to {device} (was {cur}).", "INFO")
+            model.to(device)
+        except RuntimeError as e:
+            if _is_cuda_oom(e):
+                log_step(f"Aborted: CUDA OOM while moving {label.lower()} to device.", "ERROR")
+                raise
+            raise
+
+    # Baseline model is usually already placed by BaseEditor; keep this as a safety net.
+    try:
+        _maybe_move_model_to_device(editor.model, "Baseline model")
+    except RuntimeError:
+        return
 
     ppl_texts: List[str] = []
     ppl_m0: Optional[float] = None
