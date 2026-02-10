@@ -8,7 +8,7 @@ model_name: ./hugging_cache/qwen-7b
 model_class: AutoModelForCausalLM
 tokenizer_class: AutoTokenizer
 tokenizer_name: ./hugging_cache/qwen-7b
-model_parallel: false
+model_parallel: true
 inner_params:
 - transformer.h.29.mlp.w1.weight
 - transformer.h.29.mlp.w2.weight

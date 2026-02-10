@@ -20,4 +20,4 @@ mlp_module_tmp: "transformer.encoder.layers.{}.mlp"
 attn_module_tmp: "transformer.encoder.layers.{}.self_attention"
 ln_f_module: "transformer.encoder.final_layernorm"
 lm_head_module: "transformer.output_layer"
-model_parallel: false
+model_parallel: true

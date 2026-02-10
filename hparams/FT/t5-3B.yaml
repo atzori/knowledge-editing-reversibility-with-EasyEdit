@@ -20,4 +20,4 @@ mlp_module_tmp: "decoder.block.{}.layer.2.DenseReluDense"
 attn_module_tmp: "decoder.block.{}.EncDecAttention"
 ln_f_module: "decoder.final_layer_norm"
 lm_head_module: "shared"
-model_parallel: false
+model_parallel: true

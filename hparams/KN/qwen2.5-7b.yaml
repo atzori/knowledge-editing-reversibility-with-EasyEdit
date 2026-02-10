@@ -1,7 +1,7 @@
 alg_name: "KN"
 model_name: "./hugging_cache/Qwen2.5-7B"
 device: 1
-model_parallel: false
+model_parallel: true
 
 lr_scale: 1.0
 n_toks: 10

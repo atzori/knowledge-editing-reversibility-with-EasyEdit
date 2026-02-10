@@ -23,4 +23,4 @@ mlp_module_tmp: "model.layers.{}.mlp"
 attn_module_tmp: "model.layers.{}.self_attn"
 ln_f_module: "model.norm"
 lm_head_module: "lm_head"
-model_parallel: false
+model_parallel: true

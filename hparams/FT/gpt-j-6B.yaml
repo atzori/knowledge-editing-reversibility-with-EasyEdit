@@ -24,4 +24,4 @@ mlp_module_tmp: "transformer.h.{}.mlp"
 attn_module_tmp: "transformer.h.{}.attn"
 ln_f_module: "transformer.ln_f"
 lm_head_module: "lm_head"
-model_parallel: false
+model_parallel: true
