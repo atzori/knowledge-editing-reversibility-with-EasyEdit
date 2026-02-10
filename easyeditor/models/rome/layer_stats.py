@@ -216,7 +216,15 @@ def layer_stats(
     batch_count = (n_items + batch_size - 1) // batch_size if n_items is not None else None
 
     # Resolve device safely
-    if hparams is not None and hasattr(hparams, "device") and hparams.device is not None:
+    # - If the model is sharded via HF `device_map`, inputs should be placed on the
+    #   device of the first parameter (typically the embedding device).
+    # - Otherwise, honor hparams.device when available.
+    if hasattr(model, "hf_device_map"):
+        try:
+            dev = str(next(model.parameters()).device)
+        except Exception:
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+    elif hparams is not None and hasattr(hparams, "device") and hparams.device is not None:
         # Convention: -1 means CPU
         dev = "cpu" if str(hparams.device) == "-1" else f"cuda:{hparams.device}"
     else:

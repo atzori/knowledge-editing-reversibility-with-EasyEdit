@@ -50,9 +50,10 @@ def get_inv_cov(
             precision=mom2_dtype,
             hparams=hparams
         )
-        inv_mom2_cache[key] = torch.inverse(
-            stat.mom2.moment().to(f"cuda:{hparams.device}")
-        ).float()  # Cast back to float32
+        # NOTE: In model-parallel / device_map execution, the traced layer inputs (and thus
+        # the collected mom2) may live on a different CUDA device than `hparams.device`.
+        # Keep the inverse on the same device as the collected stats and move it later if needed.
+        inv_mom2_cache[key] = torch.inverse(stat.mom2.moment()).float()  # Cast back to float32
 
     return inv_mom2_cache[key]
 

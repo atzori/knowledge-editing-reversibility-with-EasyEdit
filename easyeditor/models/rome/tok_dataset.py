@@ -95,5 +95,10 @@ def flatten_masked_batch(data, mask):
     Flattens feature data, ignoring items that are masked out of attention.
     """
     flat_data = data.view(-1, data.size(-1))
-    attended_tokens = mask.view(-1).nonzero()[:, 0]
-    return flat_data[attended_tokens]
+    attended_tokens = mask.view(-1).nonzero(as_tuple=False)[:, 0]
+    # In model-parallel / device_map setups, `data` may live on a different CUDA device
+    # than the input `mask`. PyTorch requires index tensors to be on CPU or on the same
+    # device as the indexed tensor.
+    if attended_tokens.device != flat_data.device:
+        attended_tokens = attended_tokens.to(flat_data.device)
+    return flat_data.index_select(0, attended_tokens)

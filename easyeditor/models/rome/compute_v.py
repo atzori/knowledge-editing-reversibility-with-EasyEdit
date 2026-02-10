@@ -27,14 +27,22 @@ def compute_v(
 
     print("Computing right vector (v)")
 
-    # Tokenize target into list of int token IDs
-    target_ids = tok.encode(request["target_new"], return_tensors="pt", add_special_tokens=False).to(f"cuda:{hparams.device}")[0]
+    # Choose an input device compatible with HF device_map / model-parallel execution.
+    # For sharded models, inputs must be placed on the embedding / first-parameter device.
+    try:
+        input_device = next(model.parameters()).device
+    except StopIteration:
+        input_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Tokenize target into list of int token IDs (keep on CPU for prompt building).
+    target_id_list = tok.encode(request["target_new"], add_special_tokens=False)
+    target_ids = torch.tensor(target_id_list, dtype=torch.long)
 
     # if target_ids[0] == tok.bos_token_id or target_ids[0] == tok.unk_token_id:
     #     target_ids = target_ids[1:]
     # Compile list of rewriting and KL x/y pairs
     rewriting_prompts, kl_prompts = [
-        context.format(request["prompt"]) + tok.decode(target_ids[:-1])
+        context.format(request["prompt"]) + tok.decode(target_id_list[:-1])
         for context in context_templates
     ], ["{} is a"]
     all_prompts = rewriting_prompts + kl_prompts
@@ -43,15 +51,19 @@ def compute_v(
         [prompt.format(request["subject"]) for prompt in all_prompts],
         return_tensors="pt",
         padding=True,
-    ).to(f"cuda:{hparams.device}")
+    ).to(input_device)
 
     # Compute rewriting targets
-    rewriting_targets = torch.tensor(-100, device=f"cuda:{hparams.device}").repeat(
-        len(rewriting_prompts), *input_tok["input_ids"].shape[1:]
+    seq_len = int(input_tok["input_ids"].shape[1])
+    rewriting_targets = torch.full(
+        (len(rewriting_prompts), seq_len),
+        -100,
+        dtype=torch.long,
     )
     for i in range(len(rewriting_prompts)):
-        ex_len = input_tok["attention_mask"][i].sum()
-        rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids
+        ex_len = int(input_tok["attention_mask"][i].sum().item())
+        if len(target_ids) > 0:
+            rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids
 
     # Compute indices of the tokens where the fact is looked up
     vanilla_input_prompts = [
@@ -73,10 +85,16 @@ def compute_v(
     # Set up an optimization over a latent vector that, when output at the
     # rewrite layer, i.e. hypothesized fact lookup location, will induce the
     # target token to be predicted at the final layer.
+    try:
+        delta_device = next(
+            nethook.get_module(model, hparams.mlp_module_tmp.format(layer)).parameters()
+        ).device
+    except Exception:
+        delta_device = left_vector.device
     if hasattr(model.config, 'n_embd'):
-        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device=f"cuda:{hparams.device}")
+        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device=delta_device)
     else:
-        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device=f"cuda:{hparams.device}")
+        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device=delta_device)
     target_init, kl_distr_init = None, None
 
     # Inserts new "delta" variable at the appropriate part of the computation
@@ -133,15 +151,19 @@ def compute_v(
         # Compute loss on rewriting targets
         log_probs = torch.log_softmax(logits, dim=2)
 
+        # In model-parallel setups, `log_probs` can live on a different CUDA device
+        # than the original tokenization tensors. Align target indices to log_probs.device.
+        rewriting_targets_dev = rewriting_targets.to(device=log_probs.device)
         loss = torch.gather(
             log_probs,
             2,
-            torch.where(rewriting_targets != -100, rewriting_targets, 0).unsqueeze(2),
+            torch.where(rewriting_targets_dev != -100, rewriting_targets_dev, 0).unsqueeze(2),
         ).squeeze(2)
-        mask = (rewriting_targets != -100).float()
+        mask = (rewriting_targets_dev != -100).float()
 
         # Aggregate total losses
-        nll_loss_each = -(loss * mask).sum(1) / target_ids.size(0)
+        denom = max(int(target_ids.numel()), 1)
+        nll_loss_each = -(loss * mask).sum(1) / denom
         nll_loss = nll_loss_each.mean()
         kl_loss = hparams.kl_factor * torch.nn.functional.kl_div(
             kl_distr_init, kl_log_probs, log_target=True, reduction="batchmean"
@@ -150,7 +172,7 @@ def compute_v(
             torch.norm(delta) / torch.norm(target_init) ** 2
         )
         # weight_decay = hparams.v_weight_decay * torch.norm(delta) ** 2
-        loss = nll_loss + kl_loss + weight_decay
+        loss = nll_loss + kl_loss + weight_decay.to(nll_loss.device)
         print(
             f"loss {np.round(loss.item(), 3)} = {np.round(nll_loss.item(), 3)} + {np.round(kl_loss.item(), 3)} + {np.round(weight_decay.item(), 3)} "
             f"avg prob of [{request['target_new']}] "
