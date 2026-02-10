@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -172,9 +172,10 @@ def compute_ppl(
         logits = out.logits  # [B, T, V]
 
         # Shift for next-token prediction
+        logits_device = logits.device
         shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = batch_ids[..., 1:].contiguous()
-        shift_attn = batch_attn[..., 1:].contiguous()
+        shift_labels = batch_ids[..., 1:].contiguous().to(logits_device)
+        shift_attn = batch_attn[..., 1:].contiguous().to(logits_device)
 
         # Token-wise NLL: [B, T-1]
         token_nll = loss_fct(shift_logits.transpose(1, 2), shift_labels)

@@ -22,27 +22,28 @@ def compute_z(
     Computes the value (right) vector for the rank-1 update.
     Runs a simple optimization procedure.
     """
-
-    # Get model parameters
-    lm_w, ln_f = (
-        nethook.get_parameter(model, f"{hparams.lm_head_module}.weight").T,
-        nethook.get_module(model, hparams.ln_f_module),
-    )
+    # Choose an input device compatible with HF device_map / model-parallel execution.
+    # For sharded models, inputs must be placed on the embedding / first-parameter device.
     try:
-        lm_b = nethook.get_parameter(model, f"{hparams.lm_head_module}.bias")
-    except LookupError as _:
-        lm_b = next(model.parameters()).new_zeros(model.config.vocab_size)
+        input_device = next(model.parameters()).device
+    except StopIteration:
+        input_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("Computing right vector (v)")
 
-    # Tokenize target into list of int token IDs
-    target_ids = tok.encode(request["target_new"], return_tensors="pt", add_special_tokens=False).to(f"cuda:{hparams.device}")[0]
+    # Tokenize target into list of int token IDs (keep on CPU for prompt building).
+    target_id_list = tok.encode(request["target_new"], add_special_tokens=False)
+    target_ids = torch.tensor(target_id_list, dtype=torch.long)
 
-    if target_ids[0] == tok.bos_token_id or target_ids[0] == tok.unk_token_id:
+    if len(target_ids) > 0 and (
+        (tok.bos_token_id is not None and int(target_ids[0]) == tok.bos_token_id)
+        or (tok.unk_token_id is not None and int(target_ids[0]) == tok.unk_token_id)
+    ):
         target_ids = target_ids[1:]
+    target_id_list = target_ids.tolist()
     # Compile list of rewriting and KL x/y pairs
     rewriting_prompts, kl_prompts = [
-        context.format(request["prompt"]) + tok.decode(target_ids[:-1])
+        context.format(request["prompt"]) + tok.decode(target_id_list[:-1])
         for context_types in context_templates
         for context in context_types
     ], ["{} is a"]
@@ -52,15 +53,19 @@ def compute_z(
         [prompt.format(request["subject"]) for prompt in all_prompts],
         return_tensors="pt",
         padding=True,
-    ).to(f"cuda:{hparams.device}")
+    ).to(input_device)
 
     # Compute rewriting targets
-    rewriting_targets = torch.tensor(-100, device=f"cuda:{hparams.device}").repeat(
-        len(rewriting_prompts), *input_tok["input_ids"].shape[1:]
+    seq_len = int(input_tok["input_ids"].shape[1])
+    rewriting_targets = torch.full(
+        (len(rewriting_prompts), seq_len),
+        -100,
+        dtype=torch.long,
     )
     for i in range(len(rewriting_prompts)):
-        ex_len = input_tok["attention_mask"][i].sum()
-        rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids
+        ex_len = int(input_tok["attention_mask"][i].sum().item())
+        if len(target_ids) > 0:
+            rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids
 
     # Compute indices of the tokens where the fact is looked up
     lookup_idxs = [
@@ -78,10 +83,16 @@ def compute_z(
     # Set up an optimization over a latent vector that, when output at the
     # rewrite layer, i.e. hypothesized fact lookup location, will induce the
     # target token to be predicted at the final layer.
+    try:
+        delta_device = next(
+            nethook.get_module(model, hparams.layer_module_tmp.format(layer)).parameters()
+        ).device
+    except Exception:
+        delta_device = input_device
     if hasattr(model.config, 'n_embd'):
-        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device=f"cuda:{hparams.device}")
+        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device=delta_device)
     elif hasattr(model.config, 'hidden_size'):
-        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device=f"cuda:{hparams.device}")
+        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device=delta_device)
     else:
         raise NotImplementedError
     target_init, kl_distr_init = None, None
@@ -171,28 +182,21 @@ def compute_z(
             if kl_distr_init is None:
                 kl_distr_init = kl_log_probs.detach().clone()
 
-        # Compute loss on rewriting targets
+        # Compute loss on rewriting targets (use final logits for device-map safety).
+        rewrite_logits = logits[:len(rewriting_prompts)]
+        log_probs = torch.log_softmax(rewrite_logits, dim=2)
 
-        loss_layer_out = tr[hparams.layer_module_tmp.format(loss_layer)].output
-        if isinstance(loss_layer_out, (list, tuple)):
-            output = loss_layer_out[0]
-        else:
-            output = loss_layer_out
-
-        if output.shape[1]!=rewriting_targets.shape[1]:
-            output=torch.transpose(output, 0, 1)
-        full_repr = output[:len(rewriting_prompts)]
-
-        log_probs = torch.log_softmax(ln_f(full_repr) @ lm_w.to(full_repr.device) + lm_b.to(full_repr.device), dim=2)
+        rewriting_targets_dev = rewriting_targets.to(device=log_probs.device)
         loss = torch.gather(
             log_probs,
             2,
-            torch.where(rewriting_targets != -100, rewriting_targets, 0).unsqueeze(2).to(log_probs.device),
+            torch.where(rewriting_targets_dev != -100, rewriting_targets_dev, 0).unsqueeze(2),
         ).squeeze(2)
-        mask = (rewriting_targets != -100).float()
+        mask = (rewriting_targets_dev != -100).float()
 
         # Aggregate total losses
-        nll_loss_each = -(loss * mask.to(loss.device)).sum(1) / target_ids.size(0)
+        denom = max(int(target_ids.numel()), 1)
+        nll_loss_each = -(loss * mask).sum(1) / denom
         nll_loss = nll_loss_each.mean()
         kl_loss = hparams.kl_factor * torch.nn.functional.kl_div(
             kl_distr_init, kl_log_probs, log_target=True, reduction="batchmean"

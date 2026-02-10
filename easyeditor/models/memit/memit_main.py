@@ -47,9 +47,10 @@ def apply_memit_to_model(
 
     with torch.no_grad():
         for w_name, (key_mat, val_mat) in deltas.items():
-            key_mat, val_mat = key_mat.to(f"cuda:{hparams.device}"), val_mat.to(f"cuda:{hparams.device}")
-            upd_matrix = key_mat @ val_mat.T
             w = nethook.get_parameter(model, w_name)
+            key_mat = key_mat.to(device=w.device)
+            val_mat = val_mat.to(device=w.device)
+            upd_matrix = key_mat @ val_mat.T
             upd_matrix = upd_matrix_match_shape(upd_matrix, w.shape)
 
             if return_orig_weights and w_name not in weights_copy:
@@ -108,6 +109,12 @@ def execute_memit(
     context_templates = get_context_templates(model, tok)
     z_layer = hparams.layers[-1]
     z_list = []
+    try:
+        z_device = next(
+            nethook.get_module(model, hparams.layer_module_tmp.format(z_layer)).parameters()
+        ).device
+    except Exception:
+        z_device = next(model.parameters()).device
 
     for request in requests:
         # Retrieve k/v pair if already stored in cache
@@ -127,7 +134,7 @@ def execute_memit(
         ):
             try:
                 data = np.load(cache_fname)
-                z_list.append(torch.from_numpy(data["v_star"]).to(f"cuda:{hparams.device}"))
+                z_list.append(torch.from_numpy(data["v_star"]).to(device=z_device))
                 data_loaded = True
             except Exception as e:
                 print(f"Error reading cache file due to {e}. Recomputing...")
@@ -143,7 +150,7 @@ def execute_memit(
                 context_templates,
             )
 
-            z_list.append(cur_z)
+            z_list.append(cur_z.to(device=z_device))
 
             if cache_fname is not None:
                 cache_fname.parent.mkdir(exist_ok=True, parents=True)
@@ -180,6 +187,7 @@ def execute_memit(
 
         repeat_factor = (layer_ks.size(1) // targets.size(1))
         targets = targets.repeat_interleave(repeat_factor, dim=1)
+        targets = targets.to(device=layer_ks.device)
 
         # Load covariance matrix
         force_recompute = False
@@ -194,7 +202,8 @@ def execute_memit(
             else hparams.mom2_n_samples // 10,
             hparams.mom2_dtype,
             force_recompute=force_recompute,
-            hparams=hparams
+            hparams=hparams,
+            device=layer_ks.device,
         )
 
         # Compute update in double precision
@@ -252,6 +261,7 @@ def get_cov(
     inv: bool = False,
     force_recompute: bool = False,
     hparams=None,
+    device: Optional[torch.device] = None,
 ) -> torch.Tensor:
     """
     Retrieves covariance statistics, then computes the algebraic inverse.
@@ -277,8 +287,23 @@ def get_cov(
         )
         COV_CACHE[key] = stat.mom2.moment().float().to("cpu")
 
+    if device is None:
+        if hasattr(model, "hf_device_map"):
+            try:
+                device = next(model.parameters()).device
+            except Exception:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif hparams is not None and hasattr(hparams, "device") and hparams.device is not None:
+            device = (
+                torch.device("cpu")
+                if str(hparams.device) == "-1"
+                else torch.device(f"cuda:{hparams.device}")
+            )
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     return (
-        torch.inverse(COV_CACHE[key].to(f"cuda:{hparams.device}")) if inv else COV_CACHE[key].to(f"cuda:{hparams.device}")
+        torch.inverse(COV_CACHE[key].to(device)) if inv else COV_CACHE[key].to(device)
     )
 
 
