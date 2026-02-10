@@ -134,7 +134,10 @@ def compute_v(
             retain_output=True,
             edit_output=edit_output_fn,
         ) as tr:
-            logits = model(**input_tok).logits
+            try:
+                logits = model(**input_tok, use_cache=False).logits
+            except TypeError:
+                logits = model(**input_tok).logits
 
             # Compute distribution for KL divergence
             kl_logits = torch.stack(
