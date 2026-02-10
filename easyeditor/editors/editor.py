@@ -62,6 +62,7 @@ class BaseEditor:
 
         if type(self.model_name) is str:
             device_map = 'auto' if hparams.model_parallel else None
+            print(f"\033[92m[device_map]\033[0m model_parallel={hparams.model_parallel} -> device_map={device_map}")
             torch_dtype = torch.float16 if hasattr(hparams, 'fp16') and hparams.fp16 else torch.float32
             
             # QLoRA configuration
