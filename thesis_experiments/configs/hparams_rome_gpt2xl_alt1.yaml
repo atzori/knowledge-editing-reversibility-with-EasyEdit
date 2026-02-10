@@ -1,0 +1,44 @@
+# EasyEdit ROME hyperparameters (consumed by load_hparams)
+# Keep ALL ROME-related settings here (mom2, layers, stats_dir, device, etc.)
+
+alg_name: "ROME"
+model_name: "gpt2-xl"
+
+# ROME regularization / misc
+v_weight_decay: 0.5
+kl_factor: 0.0625
+mom2_adjustment: false
+
+# Second-moment (mom2) stats settings
+mom2_dataset: "wikipedia"
+mom2_n_samples: 10000
+mom2_dtype: "float32"
+
+# Core ROME parameters
+layers: [17] # Layers to consider for editing, 17, 20 for GPT-2 XL is better than only 17
+fact_token: "subject_last"
+
+v_num_grad_steps: 20
+v_lr: 5e-1
+v_loss_layer: 47
+clamp_norm_factor: 4.0
+
+# Module templates (GPT-2)
+rewrite_module_tmp: "transformer.h.{}.mlp.c_proj"
+layer_module_tmp: "transformer.h.{}"
+mlp_module_tmp: "transformer.h.{}.mlp"
+attn_module_tmp: "transformer.h.{}.attn"
+
+ln_f_module: "transformer.ln_f"
+lm_head_module: "lm_head"
+
+# Context handling
+context_template_length_params:
+  - [5, 10]
+  - [10, 10]
+
+# Runtime
+stats_dir: "thesis_experiments/stats"
+device: 0
+model_parallel: true
+fp16: true
