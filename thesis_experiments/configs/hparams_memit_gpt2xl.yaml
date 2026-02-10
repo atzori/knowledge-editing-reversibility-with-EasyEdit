@@ -39,4 +39,5 @@ lm_head_module: "transformer.wte"
 # Runtime
 stats_dir: "thesis_experiments/stats"
 device: 0
+model_parallel: true
 fp16: true

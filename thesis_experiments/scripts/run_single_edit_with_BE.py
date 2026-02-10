@@ -459,8 +459,8 @@ def main():
     def _maybe_move_model_to_device(model, label: str) -> None:
         if device == "cpu":
             return
-        if model_parallel or has_device_map:
-            log_step(f"{label}: model parallel/device_map detected; skipping .to(...) to preserve sharding.", "INFO")
+        if hasattr(model, "hf_device_map"):
+            log_step(f"{label}: device_map detected; skipping .to(...) to preserve sharding.", "INFO")
             return
         try:
             cur = str(next(model.parameters()).device)
@@ -631,8 +631,7 @@ def main():
 
         # Ensure edited model is on the right device for PPL / generation
         try:
-            log_step("Moving edited model to device (may take time).")
-            edited_model.to(device)
+            _maybe_move_model_to_device(edited_model, "Edited model (M1)")
         except RuntimeError as e:
             if _is_cuda_oom(e):
                 log_step("Aborted: CUDA OOM while moving edited model to device.", "ERROR")
@@ -806,8 +805,7 @@ def main():
 
         # Ensure rollback model is on the right device
         try:
-            log_step("Moving rollback model to device (may take time).")
-            rollback_model.to(device)
+            _maybe_move_model_to_device(rollback_model, "Rollback model (M2)")
         except RuntimeError as e:
             if _is_cuda_oom(e):
                 log_step("Aborted: CUDA OOM while moving rollback model to device.", "ERROR")

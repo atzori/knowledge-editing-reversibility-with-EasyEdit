@@ -40,4 +40,5 @@ context_template_length_params:
 # Runtime
 stats_dir: "thesis_experiments/stats"
 device: 0
+model_parallel: true
 fp16: true
