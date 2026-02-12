@@ -218,9 +218,8 @@ thesis_experiments/configs/
 ### 4.5 Run the Reference Script
 
 ```bash
-python -m thesis_experiments.scripts.run_single_edit_with_BE \
-  --config thesis_experiments/configs/exp_counterfact_hf_llama32_3b_rome_single.yaml \
-  --mode both
+python -m thesis_experiments.scripts.run_edit_and_rollback \
+  --config thesis_experiments/configs/exp_gpt2xl_memit.yaml
 ```
 
 ---
