@@ -234,3 +234,8 @@ logs/
 ```
 
 Each run creates a timestamped subdirectory containing logs, metrics, and Butterfly Effect reports.
+
+---
+
+This repository is based on EasyEdit (MIT License).
+Additional modifications for thesis experiments have been introduced.
