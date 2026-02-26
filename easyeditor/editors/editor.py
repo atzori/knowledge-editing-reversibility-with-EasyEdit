@@ -153,6 +153,13 @@ class BaseEditor:
 
         self.hparams = hparams
 
+    def _resolve_eval_metric(self, eval_metric: Optional[str] = None) -> str:
+        if eval_metric is not None:
+            return eval_metric
+        if self.alg_name in ['ROME', 'R-ROME']:
+            return 'log_prob'
+        return 'exact match'
+
     def edit(self,
              prompts: Union[str, List[str]],
              target_new: Union[str, List[str]],
@@ -229,6 +236,7 @@ class BaseEditor:
         requests = _prepare_requests(prompts, target_new, ground_truth, target_neg, rephrase_prompts, locality_inputs, portability_inputs, **kwargs)
 
         assert hasattr(self.hparams, 'batch_size'), f'Method {self.alg_name} found, pls specify the batch_size....'
+        eval_metric = self._resolve_eval_metric(kwargs.get('eval_metric'))
         all_metrics = []
         for record_chunks in _chunks(requests, self.hparams.batch_size):
             start = time()
@@ -252,7 +260,7 @@ class BaseEditor:
                     'case_id': i,
                     "requested_rewrite": request,
                     "time": exec_time,
-                    "post": compute_edit_quality(edited_model, self.model_name, self.hparams, self.tok, request, self.hparams.device, test_generation=test_generation),
+                    "post": compute_edit_quality(edited_model, self.model_name, self.hparams, self.tok, request, self.hparams.device, eval_metric=eval_metric, test_generation=test_generation, pre_edit=False),
                 }
 
                 chunk_metrics.append(metrics)
@@ -274,19 +282,26 @@ class BaseEditor:
                             nethook.get_parameter(self.model, k)[...] = v.to(f"cuda:{self.hparams.device}")
 
             for i, request in enumerate(record_chunks):
-                chunk_metrics[i]["pre"] = compute_edit_quality(self.model, self.model_name, self.hparams, self.tok, request, self.hparams.device, test_generation=test_generation)
+                chunk_metrics[i]["pre"] = compute_edit_quality(self.model, self.model_name, self.hparams, self.tok, request, self.hparams.device, eval_metric=eval_metric, test_generation=test_generation, pre_edit=True)
 
                 if 'locality' in chunk_metrics[i]['post'].keys():
+                    has_output_based_locality = False
                     for locality_key in request['locality'].keys():
+                        output_key = f'{locality_key}_output'
+                        if output_key not in chunk_metrics[i]['post']['locality'] or \
+                            output_key not in chunk_metrics[i]['pre'].get('locality', {}):
+                            continue
+                        has_output_based_locality = True
                         locality_result = []
                         if hasattr(self.hparams, 'evaluation_type') and self.hparams.evaluation_type == "LLM-judge":
-                            locality_result.append(float(chunk_metrics[i]['post']['locality'][f'{locality_key}_output']==chunk_metrics[i]['pre']['locality'][f'{locality_key}_output']))
+                            locality_result.append(float(chunk_metrics[i]['post']['locality'][output_key]==chunk_metrics[i]['pre']['locality'][output_key]))
                         else:
-                            for ans, label in zip(chunk_metrics[i]['post']['locality'][f'{locality_key}_output'], chunk_metrics[i]['pre']['locality'][f'{locality_key}_output']):
+                            for ans, label in zip(chunk_metrics[i]['post']['locality'][output_key], chunk_metrics[i]['pre']['locality'][output_key]):
                                 locality_result.append(np.mean(np.equal(ans, label)))
                         chunk_metrics[i]['post']['locality'][f'{locality_key}_acc'] = locality_result
-                        chunk_metrics[i]['post']['locality'].pop(f'{locality_key}_output')
-                    chunk_metrics[i]['pre'].pop('locality')
+                        chunk_metrics[i]['post']['locality'].pop(output_key)
+                    if has_output_based_locality and 'locality' in chunk_metrics[i]['pre']:
+                        chunk_metrics[i]['pre'].pop('locality')
 
                 if verbose:
                     LOG.info(
@@ -312,7 +327,7 @@ class BaseEditor:
         `locality_inputs`: dict
             for locality
         """
-        eval_metric= kwargs['eval_metric'] if 'eval_metric' in kwargs.keys() else 'exact match'
+        eval_metric = self._resolve_eval_metric(kwargs.get('eval_metric'))
         if hasattr(self.hparams, 'batch_size'):  # For Singleton Editing, bs=1
             assert self.hparams.batch_size == 1, 'Single Editing: batch_size should be set to 1'
         all_metrics = []
@@ -325,7 +340,7 @@ class BaseEditor:
                     assert 'train_ds' in kwargs.keys(), print('IKE need train_ds(For getting In-Context prompt)')
                     metrics = {"pre": compute_icl_edit_quality(self.model, self.model_name, self.hparams, self.tok, [''], request, self.hparams.device, pre_edit=True)}
                 else:
-                    metrics = {"pre": compute_edit_quality(self.model, self.model_name, self.hparams, self.tok, request, self.hparams.device, eval_metric=eval_metric, test_generation=test_generation)}
+                    metrics = {"pre": compute_edit_quality(self.model, self.model_name, self.hparams, self.tok, request, self.hparams.device, eval_metric=eval_metric, test_generation=test_generation, pre_edit=True)}
                 all_metrics.append(metrics)
             if 'pre_file' in kwargs and kwargs['pre_file'] is not None:
                 json.dump(all_metrics, open(kwargs['pre_file'], 'w'), indent=4)
@@ -357,7 +372,7 @@ class BaseEditor:
             return edited_model, weights_copy, icl_examples
 
         def edit_evaluation(all_metrics, request, edited_model, idx, test_generation, icl_examples, **kwargs):
-            eval_metric= kwargs['eval_metric'] if 'eval_metric' in kwargs.keys() else 'exact match'
+            eval_metric = self._resolve_eval_metric(kwargs.get('eval_metric'))
             if self.alg_name == 'IKE':
                 all_metrics[idx].update({
                     'case_id': idx,
@@ -371,21 +386,28 @@ class BaseEditor:
                 all_metrics[idx].update({
                     'case_id': idx,
                     "requested_rewrite": request,
-                    "post": compute_edit_quality(edited_model, self.model_name, self.hparams, self.tok, request, self.hparams.device, eval_metric=eval_metric, test_generation=test_generation),
+                    "post": compute_edit_quality(edited_model, self.model_name, self.hparams, self.tok, request, self.hparams.device, eval_metric=eval_metric, test_generation=test_generation, pre_edit=False),
                 })
                 if "metric_kwargs" in kwargs:
                     all_metrics[idx].update(compute_sent_metric(self.model, edited_model, self.model_name, self.hparams, self.tok,metric_kwargs=kwargs["metric_kwargs"][idx], device=self.hparams.device))
                 if 'locality' in all_metrics[idx]['post'].keys() and not hasattr(self.hparams, 'evaluation_type'):
+                    has_output_based_locality = False
                     for locality_key in request['locality'].keys():
+                        output_key = f'{locality_key}_output'
+                        if output_key not in all_metrics[idx]['post']['locality'] or \
+                            output_key not in all_metrics[idx]['pre'].get('locality', {}):
+                            continue
+                        has_output_based_locality = True
                         locality_result = []
                         if hasattr(self.hparams, 'evaluation_type'):
-                            locality_result.append(float(all_metrics[idx]['post']['locality'][f'{locality_key}_output']==all_metrics[idx]['pre']['locality'][f'{locality_key}_output']))
+                            locality_result.append(float(all_metrics[idx]['post']['locality'][output_key]==all_metrics[idx]['pre']['locality'][output_key]))
                         else:
-                            for ans, label in zip(all_metrics[idx]['post']['locality'][f'{locality_key}_output'], all_metrics[idx]['pre']['locality'][f'{locality_key}_output']):
+                            for ans, label in zip(all_metrics[idx]['post']['locality'][output_key], all_metrics[idx]['pre']['locality'][output_key]):
                                 locality_result.append(np.mean(np.equal(ans, label)))
                         all_metrics[idx]['post']['locality'][f'{locality_key}_acc'] = locality_result
-                        all_metrics[idx]['post']['locality'].pop(f'{locality_key}_output')
-                    all_metrics[idx]['pre'].pop('locality')
+                        all_metrics[idx]['post']['locality'].pop(output_key)
+                    if has_output_based_locality and 'locality' in all_metrics[idx]['pre']:
+                        all_metrics[idx]['pre'].pop('locality')
 
             if verbose:
                 LOG.info(f"{idx} editing: {request['prompt']} -> {request['target_new']}  \n\n {all_metrics[idx]}")
@@ -646,4 +668,3 @@ class BaseEditor:
     ):
         metrics = self.apply_algo(datasets, self.hparams)
         return metrics
-

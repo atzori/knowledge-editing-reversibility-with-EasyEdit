@@ -496,6 +496,157 @@ def answer_match(
 
     return verify_answer(predict,target_new)
 
+def _to_string_list(value: typing.Union[str, typing.List[str]]) -> typing.List[str]:
+    if isinstance(value, list):
+        return ["" if v is None else str(v) for v in value]
+    return ["" if value is None else str(value)]
+
+def _broadcast_to_length(values: typing.List[str], length: int, field_name: str) -> typing.List[str]:
+    if len(values) == length:
+        return values
+    if len(values) == 1:
+        return values * length
+    raise ValueError(f"Mismatched number of {field_name}. Expected 1 or {length}, got {len(values)}.")
+
+def _resolve_device(device) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, int):
+        return torch.device(f"cuda:{device}" if torch.cuda.is_available() else "cpu")
+    if isinstance(device, str):
+        if device.isdigit():
+            return torch.device(f"cuda:{device}" if torch.cuda.is_available() else "cpu")
+        return torch.device(device)
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+def _target_suffix_for_concat(prompt: str, target: str) -> str:
+    if not prompt:
+        return target
+    if prompt.endswith((" ", "\n", "\t")) or target.startswith((" ", "\n", "\t")):
+        return target
+    return " " + target
+
+def batch_target_log_likelihood(
+    model,
+    tok,
+    prompts: typing.Union[str, typing.List[str]],
+    targets: typing.Union[str, typing.List[str]],
+    device,
+):
+    prompts_list = _to_string_list(prompts)
+    targets_list = _broadcast_to_length(_to_string_list(targets), len(prompts_list), "targets")
+    device_obj = _resolve_device(device)
+    is_encoder_decoder = bool(getattr(getattr(model, "config", None), "is_encoder_decoder", False))
+
+    sum_logprobs = []
+    mean_logprobs = []
+    token_counts = []
+
+    for prompt, target in zip(prompts_list, targets_list):
+        if is_encoder_decoder:
+            src_tok = tok(prompt, return_tensors="pt", add_special_tokens=False).to(device_obj)
+            tgt_tok = tok(target, return_tensors="pt", add_special_tokens=False).to(device_obj)
+            target_ids = tgt_tok["input_ids"]
+
+            if target_ids.size(1) == 0:
+                sum_logprobs.append(float("-inf"))
+                mean_logprobs.append(float("-inf"))
+                token_counts.append(0)
+                continue
+
+            with torch.no_grad():
+                try:
+                    outputs = model(
+                        input_ids=src_tok["input_ids"],
+                        attention_mask=src_tok["attention_mask"],
+                        labels=target_ids,
+                        use_cache=False,
+                    )
+                except TypeError:
+                    outputs = model(
+                        input_ids=src_tok["input_ids"],
+                        attention_mask=src_tok["attention_mask"],
+                        labels=target_ids,
+                    )
+                logits = outputs if isinstance(outputs, torch.Tensor) else outputs.logits
+
+            valid_tgt = target_ids[:, : logits.size(1)]
+            token_log_probs = (
+                F.log_softmax(logits[:, : valid_tgt.size(1), :], dim=-1)
+                .gather(-1, valid_tgt.unsqueeze(-1))
+                .squeeze(-1)
+            )
+        else:
+            target_suffix = _target_suffix_for_concat(prompt, target)
+            full_text = prompt + target_suffix
+            full_tok = tok(full_text, return_tensors="pt", add_special_tokens=False).to(device_obj)
+            target_ids = tok(target_suffix, return_tensors="pt", add_special_tokens=False)["input_ids"]
+
+            full_ids = full_tok["input_ids"]
+            target_len = int(target_ids.size(1))
+            if target_len == 0 or full_ids.size(1) <= target_len:
+                sum_logprobs.append(float("-inf"))
+                mean_logprobs.append(float("-inf"))
+                token_counts.append(0)
+                continue
+
+            with torch.no_grad():
+                try:
+                    outputs = model(**full_tok, use_cache=False)
+                except TypeError:
+                    outputs = model(**full_tok)
+                logits = outputs if isinstance(outputs, torch.Tensor) else outputs.logits
+
+            shift_logits = logits[:, :-1, :]
+            shift_labels = full_ids[:, 1:]
+            token_log_probs = (
+                F.log_softmax(shift_logits, dim=-1)
+                .gather(-1, shift_labels.unsqueeze(-1))
+                .squeeze(-1)
+            )
+            token_log_probs = token_log_probs[:, -target_len:]
+
+        if token_log_probs.size(1) == 0:
+            sum_logprobs.append(float("-inf"))
+            mean_logprobs.append(float("-inf"))
+            token_counts.append(0)
+            continue
+
+        sum_logprobs.append(token_log_probs.sum().item())
+        mean_logprobs.append(token_log_probs.mean().item())
+        token_counts.append(int(token_log_probs.size(1)))
+
+    return {
+        "sum_logprobs": sum_logprobs,
+        "mean_logprobs": mean_logprobs,
+        "token_counts": token_counts,
+    }
+
+def compare_targets_log_likelihood(
+    model,
+    tok,
+    prompts: typing.Union[str, typing.List[str]],
+    positive_targets: typing.Union[str, typing.List[str]],
+    negative_targets: typing.Union[str, typing.List[str]],
+    device,
+):
+    pos_scores = batch_target_log_likelihood(model, tok, prompts, positive_targets, device)
+    neg_scores = batch_target_log_likelihood(model, tok, prompts, negative_targets, device)
+
+    positive_logprob = pos_scores["sum_logprobs"]
+    negative_logprob = neg_scores["sum_logprobs"]
+    margin = [p - n for p, n in zip(positive_logprob, negative_logprob)]
+    acc = [float(m > 0) for m in margin]
+
+    return {
+        "acc": acc,
+        "margin": margin,
+        "positive_logprob": positive_logprob,
+        "negative_logprob": negative_logprob,
+        "positive_token_count": pos_scores["token_counts"],
+        "negative_token_count": neg_scores["token_counts"],
+    }
+
 def slice_list(matrix,start_indices,left):
     if isinstance(matrix[0], list):
         if left:

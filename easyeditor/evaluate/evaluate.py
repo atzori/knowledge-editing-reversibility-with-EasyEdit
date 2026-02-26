@@ -19,6 +19,7 @@ from .evaluate_utils import (
     test_batch_prediction_acc, 
     test_prediction_acc,
     test_prediction_acc_LLM_judge,
+    compare_targets_log_likelihood,
     test_generation_quality, 
     test_concept_gen,
     test_safety_gen,
@@ -40,7 +41,8 @@ def compute_edit_quality(
     record: typing.Dict,
     device,
     eval_metric: str = 'token_em',
-    test_generation = False
+    test_generation = False,
+    pre_edit: bool = False,
 ) -> typing.Dict:
     """
     Given a rewritten model, computes generalization and specificity metrics for
@@ -64,14 +66,14 @@ def compute_edit_quality(
     rewrite_prompts = record["prompt"]
     rephrase_prompts = record["rephrase_prompt"] if 'rephrase_prompt' in record.keys() else None
     ret = compute_rewrite_or_rephrase_quality(model, model_name, hparams, tok,
-                                              rewrite_prompts, target_new, device=device, eval_metric=eval_metric)
+                                              rewrite_prompts, target_new, device=device, ground_truth=ground_truth, eval_metric=eval_metric, pre_edit=pre_edit)
 
     ret['locality'] = {}
     ret['portability'] = {}
     if rephrase_prompts is not None:
         ret.update(
             compute_rewrite_or_rephrase_quality(model, model_name, hparams, tok,
-                                                rephrase_prompts, target_new, device=device, test_rephrase=True, eval_metric=eval_metric)
+                                                rephrase_prompts, target_new, device=device, ground_truth=ground_truth, test_rephrase=True, eval_metric=eval_metric, pre_edit=pre_edit)
         )
 
     if 'locality' in record.keys() and any(record['locality']):
@@ -79,7 +81,7 @@ def compute_edit_quality(
             ret['locality'].update(
                 compute_locality_quality(model, model_name, hparams, tok, locality_key,
                                          record['locality'][locality_key]['prompt'],
-                                         record['locality'][locality_key]['ground_truth'], device=device)
+                                         record['locality'][locality_key]['ground_truth'], device=device, target_new=target_new, eval_metric=eval_metric)
             )
     if 'portability' in record.keys() and any(record['portability']):
         for portability_key in record['portability'].keys():
@@ -103,8 +105,10 @@ def compute_rewrite_or_rephrase_quality(
     prompt: str,
     target_new: str,
     device,
+    ground_truth: typing.Optional[str] = None,
     test_rephrase: bool = False,
-    eval_metric: str = 'token_em'
+    eval_metric: str = 'token_em',
+    pre_edit: bool = False,
 ) -> typing.Dict:
     
     if not test_rephrase:
@@ -124,7 +128,36 @@ def compute_rewrite_or_rephrase_quality(
             f"{key}_gen_content": gen_content_model
         }
     else:  # traditional evaluation 
-        if eval_metric == 'ppl':
+        if eval_metric in ['log_prob', 'rome', 'log_likelihood']:
+            if ground_truth is None:
+                raise ValueError(f"{key} log-prob evaluation requires `ground_truth`.")
+            ll_stats = compare_targets_log_likelihood(
+                model=model,
+                tok=tok,
+                prompts=prompt,
+                positive_targets=target_new,
+                negative_targets=ground_truth,
+                device=device,
+            )
+            # ROME-consistent orientation:
+            # - pre-edit:  prefer ground_truth over target_new
+            # - post-edit: prefer target_new over ground_truth
+            target_new_logprob = ll_stats["positive_logprob"]
+            ground_truth_logprob = ll_stats["negative_logprob"]
+            if pre_edit:
+                margin = [g - t for t, g in zip(target_new_logprob, ground_truth_logprob)]
+            else:
+                margin = [t - g for t, g in zip(target_new_logprob, ground_truth_logprob)]
+            acc = [float(m > 0) for m in margin]
+            ret = {
+                f"{key}_acc": acc,
+                f"{key}_margin": margin,
+                f"{key}_target_new_logprob": target_new_logprob,
+                f"{key}_ground_truth_logprob": ground_truth_logprob,
+                f"{key}_target_new_token_count": ll_stats["positive_token_count"],
+                f"{key}_ground_truth_token_count": ll_stats["negative_token_count"],
+            }
+        elif eval_metric == 'ppl':
             ppl = PPL(model, tok, prompt, target_new, device)
             ret = {
                 f"{key}_ppl": ppl
@@ -165,11 +198,35 @@ def compute_locality_quality(
     prompt: typing.Union[str, List[str]],
     locality_ground_truth: typing.Union[str, List[str]],
     device,
+    target_new: typing.Optional[typing.Union[str, List[str]]] = None,
+    eval_metric: str = 'token_em',
 ) -> typing.Dict:
 
     # using real-world evaluation: autoregressive decoding, natural stop criteria, LLM-as-a-Judge
     if hasattr(hparams, 'evaluation_type'):
         loc_tokens = test_prediction_acc_LLM_judge(model, tok, hparams, prompt, locality_ground_truth, device, locality=True)
+        ret = {
+            f"{locality_key}_output": loc_tokens
+        }
+    elif eval_metric in ['log_prob', 'rome', 'log_likelihood']:
+        if target_new is None:
+            raise ValueError("Locality log-prob evaluation requires `target_new`.")
+        ll_stats = compare_targets_log_likelihood(
+            model=model,
+            tok=tok,
+            prompts=prompt,
+            positive_targets=locality_ground_truth,
+            negative_targets=target_new,
+            device=device,
+        )
+        ret = {
+            f"{locality_key}_acc": ll_stats["acc"],
+            f"{locality_key}_margin": ll_stats["margin"],
+            f"{locality_key}_ground_truth_logprob": ll_stats["positive_logprob"],
+            f"{locality_key}_target_new_logprob": ll_stats["negative_logprob"],
+            f"{locality_key}_ground_truth_token_count": ll_stats["positive_token_count"],
+            f"{locality_key}_target_new_token_count": ll_stats["negative_token_count"],
+        }
     else:  # traditional evaluation 
         if 't5' in model_name.lower():
             loc_tokens = test_seq2seq_batch_prediction_acc(model, tok, hparams, prompt, locality_ground_truth, device, locality=True)
@@ -177,10 +234,9 @@ def compute_locality_quality(
             loc_tokens = test_prediction_acc(model, tok, hparams, prompt, locality_ground_truth, device, locality=True, vanilla_generation=hparams.alg_name=='GRACE')
         if type(loc_tokens) is not list:
             loc_tokens = [loc_tokens,]
-
-    ret = {
-        f"{locality_key}_output": loc_tokens
-    }
+        ret = {
+            f"{locality_key}_output": loc_tokens
+        }
     return ret
 
 def compute_portability_quality(

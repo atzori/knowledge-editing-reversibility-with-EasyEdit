@@ -76,6 +76,8 @@ def apply_edit(
     target_new: str,
     verbose: bool,
     suppress_internal_prints: bool,
+    eval_metric: str = None,
+    enable_portability_metrics: bool = False,
     locality_prompts: List = None,
     portability_prompts: List = None,
 ):
@@ -101,6 +103,8 @@ def apply_edit(
         verbose=verbose,
         test_generation=False,
     )
+    if eval_metric:
+        kwargs["eval_metric"] = eval_metric
 
     # ----------------------------
     # Portability -> rephrase_prompts (+ optional portability_inputs)
@@ -116,14 +120,13 @@ def apply_edit(
 
         if rp:
             kwargs["rephrase_prompts"] = rp
-            kwargs["portability_inputs"] = {
-                "rephrase": {
-                    "prompt": [rp],
-                    # If you don't have gold answers for paraphrases,
-                    # a common fallback is to use the new target.
-                    "ground_truth": [[target_new] * len(rp)],
+            if enable_portability_metrics:
+                kwargs["portability_inputs"] = {
+                    "rephrase": {
+                        "prompt": [rp],
+                        "ground_truth": [[target_new] * len(rp)],
+                    }
                 }
-            }
 
     # ----------------------------
     # Locality -> locality_inputs (nested lists: one entry per edit)
@@ -139,7 +142,7 @@ def apply_edit(
                 gt_lp.append(str(x.get("ground_truth", x.get("answer", x.get("target", "")))))
             else:
                 lp.append(str(x))
-                gt_lp.append("")  # placeholder if no gold label is available
+                gt_lp.append(str(ground_truth))
 
         lp = [p for p in lp if p.strip()]
 

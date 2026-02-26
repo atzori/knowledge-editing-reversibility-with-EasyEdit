@@ -50,7 +50,7 @@ def compute_concept_edit_quality(
     rephrase_prompts = record["rephrase_prompt"] if 'rephrase_prompt' in record.keys() else None
 
     ret = compute_rewrite_or_rephrase_quality(model, model_name, hparams, tok,
-                                              PMT + rewrite_prompts, target_new, device=device, eval_metric=eval_metric)
+                                              PMT + rewrite_prompts, target_new, device=device, ground_truth=ground_truth, eval_metric=eval_metric)
     if test_concept_consistency:
         least_length_gen = 40
         ret['gen_concept_text'] = test_concept_gen(model, tok, least_length_gen,
@@ -61,7 +61,7 @@ def compute_concept_edit_quality(
     if rephrase_prompts is not None:
         ret.update(
             compute_rewrite_or_rephrase_quality(model, model_name, hparams, tok,
-                                                PMT + rephrase_prompts, target_new, device=device, test_rephrase=True,
+                                                PMT + rephrase_prompts, target_new, device=device, ground_truth=ground_truth, test_rephrase=True,
                                                 eval_metric=eval_metric)
         )
 
@@ -70,7 +70,7 @@ def compute_concept_edit_quality(
             ret['locality'].update(
                 compute_locality_quality(model, model_name, hparams, tok, locality_key,
                                          PMT + record['locality'][locality_key]['prompt'],
-                                         record['locality'][locality_key]['ground_truth'], device=device)
+                                         record['locality'][locality_key]['ground_truth'], device=device, target_new=target_new, eval_metric=eval_metric)
             )
 
     if 'instance' in record.keys() and any(record['instance']):
@@ -82,4 +82,3 @@ def compute_concept_edit_quality(
             )
 
     return ret
-

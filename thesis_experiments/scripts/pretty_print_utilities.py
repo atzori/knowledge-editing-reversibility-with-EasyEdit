@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from tabulate import tabulate
@@ -24,6 +24,13 @@ def _value_to_str(v: Any) -> str:
         return f"{f:.4f}"
 
     if isinstance(v, list):
+        # If list has a single numeric element, print it as a single scalar
+        # (common for acc=[1.0] or acc=[0.0]).
+        if len(v) == 1:
+            f1 = _to_float(v[0])
+            if f1 is not None:
+                return f"{f1:.4f}"
+
         # If list is numeric -> show mean and length.
         floats = [x for x in (_to_float(xi) for xi in v) if x is not None]
         if floats and len(floats) == len(v):
@@ -93,7 +100,53 @@ def _iter_metric_cases(metrics: Any) -> List[Tuple[str, Dict[str, Any], Dict[str
     return [("0", {}, {})]
 
 
-def print_metrics_table(metrics: Any, *, title: str) -> None:
+def _filter_metric_groups(metric_dict: Dict[str, Any], include_groups: Optional[Sequence[str]]) -> Dict[str, Any]:
+    if not include_groups:
+        return metric_dict
+
+    groups = {g.strip().lower() for g in include_groups if str(g).strip()}
+    out: Dict[str, Any] = {}
+
+    if "rewrite" in groups:
+        for k, v in metric_dict.items():
+            if str(k).startswith("rewrite_"):
+                out[k] = v
+
+    if "rephrase" in groups:
+        for k, v in metric_dict.items():
+            if str(k).startswith("rephrase_"):
+                out[k] = v
+
+    if "neighborhood" in groups:
+        loc = metric_dict.get("locality")
+        if isinstance(loc, dict):
+            loc_filtered = {k: v for k, v in loc.items() if str(k).startswith("neighborhood_")}
+            if loc_filtered:
+                out["locality"] = loc_filtered
+
+    return out
+
+
+def _keep_only_accuracy(metric_dict: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in metric_dict.items():
+        ks = str(k)
+        if ks.endswith("_acc"):
+            out[k] = v
+        elif ks == "locality" and isinstance(v, dict):
+            loc_acc = {lk: lv for lk, lv in v.items() if str(lk).endswith("_acc")}
+            if loc_acc:
+                out[k] = loc_acc
+    return out
+
+
+def print_metrics_table(
+    metrics: Any,
+    *,
+    title: str,
+    include_groups: Optional[Sequence[str]] = None,
+    accuracy_only: bool = False,
+) -> None:
     """Print PRE vs POST metrics in a readable table."""
     cases = _iter_metric_cases(metrics)
     print(f"\n=== {title} ===")
@@ -103,8 +156,14 @@ def print_metrics_table(metrics: Any, *, title: str) -> None:
         return
 
     for case_label, pre_dict, post_dict in cases:
-        pre = metrics_to_str_dict(pre_dict)
-        post = metrics_to_str_dict(post_dict)
+        pre_filtered = _filter_metric_groups(pre_dict, include_groups)
+        post_filtered = _filter_metric_groups(post_dict, include_groups)
+        if accuracy_only:
+            pre_filtered = _keep_only_accuracy(pre_filtered)
+            post_filtered = _keep_only_accuracy(post_filtered)
+
+        pre = metrics_to_str_dict(pre_filtered)
+        post = metrics_to_str_dict(post_filtered)
 
         keys = sorted(set(pre.keys()) | set(post.keys()))
         rows = [[k, pre.get(k, "-"), post.get(k, "-")] for k in keys]
