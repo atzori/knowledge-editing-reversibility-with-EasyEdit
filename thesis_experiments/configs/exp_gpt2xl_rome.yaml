@@ -17,11 +17,14 @@ hf_subset: null
 
 # - Local dataset path (JSON/JSONL):
 exp_dataset_path: ""
+exp_counterfact_percent_key: 0.5
 
 # Sampling / selection
 exp_sample_k: null
 exp_sample_index: 100
 exp_seed: 42
+exp_reverse_start_index: 0
+exp_reverse_out_path: "logs/reverse_counterfact_gpt2xl_rome.jsonl"
 
 # Runner controls
 exp_forced_model_name: "gpt2-xl"
@@ -29,7 +32,7 @@ exp_eval_metric: "log_prob"
 exp_max_new_tokens: 5
 exp_temperature: 0.7
 exp_do_sample: true
-exp_suppress_internal_prints: false
+exp_suppress_internal_prints: true
 exp_verbose: false
 exp_allow_hf_fallback: false
 

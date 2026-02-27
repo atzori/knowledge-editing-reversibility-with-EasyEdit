@@ -22,6 +22,8 @@ exp_dataset_path: ""
 exp_sample_k: null
 exp_sample_index: 100
 exp_seed: 42
+exp_reverse_start_index: 0
+exp_reverse_out_path: "logs/reverse_counterfact_gptj6b_memit.jsonl"
 
 # Runner controls
 exp_forced_model_name: "EleutherAI/gpt-j-6b"
