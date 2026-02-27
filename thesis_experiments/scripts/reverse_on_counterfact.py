@@ -1,21 +1,11 @@
-#!/usr/bin/env python3
-"""
-Run edit+rollback on a percentage of CounterFact samples defined in a YAML config.
-
-Usage:
-  python reverse_on_counterfact.py --config thesis_experiments/configs/exp_gpt2xl_rome.yaml --mode both
-"""
-
 from __future__ import annotations
 
 import argparse
 import contextlib
 import json
-import math
 import os
-from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
@@ -25,7 +15,7 @@ try:
 except Exception:
     tqdm = None
 
-# Engine: must provide run_edit_and_rollback_engine(config_path, mode="both", hparams=None)
+# Engine module
 from thesis_experiments.scripts import run_edit_and_rollback_engine as engine
 
 # Reuse the same hparams loader used in your project.
@@ -39,95 +29,203 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
     return cfg
 
 
-def _normalize_fraction(x: Any) -> float:
-    """
-    Accepts:
-      - 0..1  (fraction)
-      - 0..100 (percent)
-    Returns:
-      - 0..1
-    """
-    if x is None:
-        raise ValueError("Missing percentage field in YAML config.")
-    f = float(x)
-    if f <= 0:
-        raise ValueError(f"Percentage/fraction must be > 0. Got: {x}")
-    if f <= 1.0:
-        return f
-    if f <= 100.0:
-        return f / 100.0
-    raise ValueError(f"Percentage/fraction looks invalid (>100). Got: {x}")
-
-
-def _load_counterfact_len(cfg: Dict[str, Any], cfg_path: Path) -> int:
-    """
-    Minimal loader to get dataset length to compute k.
-    Mirrors the same priority rules your engine uses (local first, HF fallback).
-    """
-    dataset_type = str(cfg.get("exp_dataset_type", "")).strip().lower()
-    if dataset_type != "counterfact":
-        raise ValueError(f"This runner expects exp_dataset_type=counterfact. Got: {dataset_type}")
-
-    local_path_raw = cfg.get("exp_local_dataset", None)
-    allow_hf_fallback = bool(cfg.get("exp_allow_hf_fallback", True))
-
-    # Local JSON list
-    if local_path_raw:
-        p = Path(str(local_path_raw)).expanduser()
-        if not p.is_absolute():
-            # Keep your existing behavior: paths are relative to project root
-            p = (cfg_path.parent.parent.parent / p).resolve()
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if not isinstance(data, list):
-                raise ValueError(f"Local CounterFact must be a JSON list: {p}")
-            return len(data)
-        if not allow_hf_fallback:
-            raise FileNotFoundError(
-                f"Local CounterFact dataset not found at: {p} and HF fallback disabled."
-            )
-
-    # HF fallback (only for length)
-    if not allow_hf_fallback:
-        raise RuntimeError("HF fallback disabled and no valid local dataset provided.")
-
-    from datasets import load_dataset  # local import to avoid cost if unused
-
-    hf_dataset = cfg.get("hf_dataset", None)
-    hf_split = cfg.get("hf_split", "test")
-    hf_subset = cfg.get("hf_subset", None)
-    if not hf_dataset:
-        raise ValueError("HF fallback requested but 'hf_dataset' missing in YAML config.")
-
-    ds = load_dataset(hf_dataset, hf_subset, split=hf_split)
-    return len(ds)
-
-
-def _write_tmp_cfg(base_cfg: Dict[str, Any], out_path: Path) -> None:
-    out_path.write_text(yaml.safe_dump(base_cfg, sort_keys=False), encoding="utf-8")
-
-
 @contextlib.contextmanager
 def suppress_output(enabled: bool):
     """Redirect stdout/stderr to /dev/null when enabled."""
     if not enabled:
         yield
         return
-
     with open(os.devnull, "w") as devnull:
         with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
             yield
 
 
+def _repo_root_from_this_file() -> Path:
+    # reverse_on_counterfact.py is in thesis_experiments/scripts/
+    # parents[2] -> repo root
+    return Path(__file__).resolve().parents[2]
+
+
+def _normalize_fraction(x: Any, default: float = 1.0) -> float:
+    """
+    Accept:
+      - float 0..1
+      - int (treated as float)
+      - str like "0.5" or "50%"
+    """
+    if x is None:
+        return float(default)
+
+    if isinstance(x, (int, float)):
+        v = float(x)
+    elif isinstance(x, str):
+        s = x.strip()
+        if s.endswith("%"):
+            try:
+                v = float(s[:-1].strip()) / 100.0
+            except Exception:
+                v = float(default)
+        else:
+            try:
+                v = float(s)
+            except Exception:
+                v = float(default)
+    else:
+        v = float(default)
+
+    if v < 0.0:
+        v = 0.0
+    if v > 1.0:
+        v = 1.0
+    return v
+
+
+def _load_counterfact_with_local_priority() -> Tuple[List[Dict[str, Any]], Path]:
+    """
+    Always try to load CounterFact from:
+      repo_root/thesis_experiments/data/counterfact/counterfact.json
+    If missing, download the official ROME CounterFact JSON into that folder.
+    Never uses HuggingFace.
+    """
+    import torch
+
+    REMOTE_URL = "https://rome.baulab.info/data/dsets/counterfact.json"
+
+    repo_root = _repo_root_from_this_file()
+    cf_dir = repo_root / "thesis_experiments" / "data" / "counterfact"
+    cf_path = cf_dir / "counterfact.json"
+
+    if not cf_path.exists():
+        engine.log_step(f"CounterFact not found at: {cf_path}", "WARNING")
+        engine.log_step(f"Downloading CounterFact from: {REMOTE_URL}", "INFO")
+        cf_dir.mkdir(parents=True, exist_ok=True)
+        torch.hub.download_url_to_file(REMOTE_URL, str(cf_path))
+
+    engine.log_step(f"Loading CounterFact from: {cf_path}", "INFO")
+    with cf_path.open("r", encoding="utf-8") as f:
+        records = json.load(f)
+
+    if not isinstance(records, list):
+        raise ValueError(f"CounterFact JSON must be a list of records. Got: {type(records)} at {cf_path}")
+
+    return records, cf_path
+
+
+def _iter_indices(*, total_n: int, start_idx: int, end_idx: Optional[int]) -> Iterable[int]:
+    if start_idx < 0:
+        raise ValueError(f"start_idx must be >= 0. Got: {start_idx}")
+    if start_idx >= total_n:
+        return []
+
+    end = total_n if end_idx is None else min(int(end_idx), total_n)
+    if end <= start_idx:
+        return []
+
+    return range(start_idx, end)
+
+
+# ----------------------------
+# CounterFact normalization (LOCAL to wrapper)
+# ----------------------------
+def _format_prompt_with_subject(prompt: str, subject: str) -> str:
+    p = (prompt or "").strip()
+    s = (subject or "").strip()
+    if not p:
+        return p
+    if "{}" in p:
+        try:
+            return p.format(s)
+        except Exception:
+            return p.replace("{}", s)
+    if "<SUBJECT>" in p:
+        return p.replace("<SUBJECT>", s)
+    return p
+
+
+def _extract_target_str(x: Any) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        for k in ("str", "text", "name"):
+            if k in x and isinstance(x[k], str):
+                return x[k]
+    return str(x)
+
+
+def _extract_list_of_prompts(value: Any, subject: str) -> List[str]:
+    out: List[str] = []
+    if value is None:
+        return out
+
+    if isinstance(value, dict):
+        value = value.get("prompts", value.get("prompt", None))
+
+    if isinstance(value, str):
+        out.append(_format_prompt_with_subject(value, subject))
+        return [p for p in out if p.strip()]
+
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                out.append(_format_prompt_with_subject(item, subject))
+            elif isinstance(item, dict):
+                p = item.get("prompt", item.get("text", item.get("template", "")))
+                if p:
+                    out.append(_format_prompt_with_subject(str(p), subject))
+
+    return [p for p in out if p.strip()]
+
+
+def normalize_counterfact_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert a CounterFact raw record into the canonical sample expected by the engine:
+      - prompt, subject, ground_truth, target_new, case_id
+      - locality_prompts (list[str])
+      - portability_prompts (list[str])
+    """
+    rr = rec.get("requested_rewrite", rec)
+
+    subject = str(rr.get("subject", rec.get("subject", "")) or "").strip()
+    prompt_t = str(rr.get("prompt", rec.get("prompt", "")) or "").strip()
+    prompt = _format_prompt_with_subject(prompt_t, subject)
+
+    gt = _extract_target_str(rr.get("target_true", rr.get("ground_truth", rec.get("ground_truth", ""))))
+    tn = _extract_target_str(rr.get("target_new", rr.get("target", rec.get("target_new", ""))))
+
+    portability_raw = (
+        rec.get("paraphrase_prompts", None)
+        or rec.get("paraphrases", None)
+        or rec.get("portability_prompts", None)
+        or rec.get("portability", None)
+    )
+
+    locality_raw = (
+        rec.get("neighborhood_prompts", None)
+        or rec.get("neighborhood", None)
+        or rec.get("locality_prompts", None)
+        or rec.get("locality", None)
+    )
+
+    portability_prompts = _extract_list_of_prompts(portability_raw, subject)
+    locality_prompts = _extract_list_of_prompts(locality_raw, subject)
+
+    return {
+        "case_id": rec.get("case_id", rec.get("id", "")),
+        "prompt": prompt,
+        "subject": subject,
+        "ground_truth": gt,
+        "target_new": tn,
+        "locality_prompts": locality_prompts,
+        "portability_prompts": portability_prompts,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Path to YAML config.")
-    ap.add_argument(
-        "--mode",
-        default="both",
-        choices=["forward", "inverse", "both"],
-        help="Override mode (forward|inverse|both).",
-    )
+    ap.add_argument("--mode", default="both", choices=["forward", "inverse", "both"])
     args = ap.parse_args()
 
     cfg_path = Path(args.config).expanduser().resolve()
@@ -136,20 +234,19 @@ def main() -> None:
 
     cfg = _read_yaml(cfg_path)
 
-    # Determine how many samples to run
-    percent_key = str(cfg.get("exp_counterfact_percent_key", "exp_counterfact_percent")).strip()
-    frac = _normalize_fraction(cfg.get(percent_key, 0.5))
-    total_n = _load_counterfact_len(cfg, cfg_path)
-    k = int(math.floor(total_n * frac))
-    if k <= 0:
-        raise ValueError(f"Computed k={k}. Check {percent_key} and dataset size={total_n}.")
+    raw_records, cf_json_path = _load_counterfact_with_local_priority()
+    total_n = len(raw_records)
+    engine.log_step(f"CounterFact size: {total_n} | Local path: {cf_json_path}", "INFO")
 
     start_idx = int(cfg.get("exp_reverse_start_index", 0))
-    if start_idx < 0:
-        raise ValueError(f"exp_reverse_start_index must be >= 0. Got: {start_idx}")
-    end_idx = min(total_n, start_idx + k)
+    frac = _normalize_fraction(cfg.get("exp_counterfact_percent", 1.0), default=1.0)
+    end_idx = int(total_n * frac)
+    engine.log_step(f"Running on CounterFact indices: start={start_idx}, end={end_idx} (fraction={frac:.2%})", "INFO")
 
-    # Load hparams ONCE and reuse
+    indices = list(_iter_indices(total_n=total_n, start_idx=start_idx, end_idx=end_idx))
+    if not indices:
+        raise RuntimeError(f"No indices to run (start={start_idx}, end={end_idx}, total={total_n}).")
+
     method = str(cfg.get("exp_method", "rome")).strip().lower()
     exp_hparams_path = str(cfg.get("exp_hparams_path", "")).strip()
     if not exp_hparams_path:
@@ -157,59 +254,45 @@ def main() -> None:
 
     hp_path = Path(exp_hparams_path).expanduser()
     if not hp_path.is_absolute():
-        hp_path = (cfg_path.parent.parent.parent / hp_path).resolve()
+        hp_path = (_repo_root_from_this_file() / hp_path).resolve()
     if not hp_path.exists():
         raise FileNotFoundError(f"Hparams file not found: {hp_path}")
 
     hparams_obj = load_hparams(method, str(hp_path))
 
-    # Output setup
-    out_path_raw = str(cfg.get("exp_reverse_out_path", "logs/run_percent_counterfact_results.jsonl")).strip()
+    out_path_raw = str(cfg.get("exp_reverse_out_path", "logs/reverse_on_counterfact_results.jsonl")).strip()
     if not out_path_raw:
         raise ValueError("exp_reverse_out_path in YAML is empty.")
     out_path = Path(out_path_raw).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Prepare a temp YAML path (we overwrite it each iteration)
-    tmp_cfg_path = out_path.parent / f".tmp_{cfg_path.stem}_iter.yaml"
-
-    # Force one edit per call unless you explicitly want batch/memit behavior
-    base_cfg = deepcopy(cfg)
-    base_cfg["exp_num_edits"] = 1
-
-    # Suppression flag from YAML (required by your request)
     suppress = bool(cfg.get("exp_suppress_internal_prints", False))
 
-    total_iters = max(end_idx - start_idx, 0)
-    iterator = range(start_idx, end_idx)
-
+    iterator = indices
     if tqdm is not None:
-        iterator = tqdm(
-            iterator,
-            total=total_iters,
-            desc="CounterFact",
-            unit="case",
-            dynamic_ncols=True,
-        )
+        iterator = tqdm(indices, total=len(indices), desc="CounterFact", unit="case", dynamic_ncols=True)
 
     with out_path.open("w", encoding="utf-8") as f_out:
         for i in iterator:
-            iter_cfg = deepcopy(base_cfg)
-            iter_cfg["exp_sample_index"] = int(i)
+            raw = raw_records[int(i)]
+            sample = normalize_counterfact_record(raw)
 
-            _write_tmp_cfg(iter_cfg, tmp_cfg_path)
+            # Guard: prevent empty prompts causing tokenizer/generate crash
+            if not str(sample.get("prompt", "")).strip():
+                engine.log_step(f"[SKIP] Empty prompt at index={i} case_id={sample.get('case_id','')}", "WARNING")
+                continue
 
             with suppress_output(suppress):
                 result = engine.run_edit_and_rollback_engine(
-                    config_path=str(tmp_cfg_path),
+                    config_path=str(cfg_path),
                     mode=args.mode or "both",
                     hparams=hparams_obj,
+                    sample=sample,
                 )
 
             f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
             f_out.flush()
 
-            # Optional: add a small postfix to tqdm if available
             if tqdm is not None and hasattr(iterator, "set_postfix"):
                 try:
                     ppl0 = result.get("ppl", {}).get("M0", None)
@@ -218,13 +301,7 @@ def main() -> None:
                 except Exception:
                     pass
 
-    # Cleanup temp cfg (optional)
-    try:
-        tmp_cfg_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-    print(f"Done. Wrote {end_idx - start_idx} runs to: {out_path}")
+    print(f"Done. Wrote results to: {out_path}")
 
 
 if __name__ == "__main__":

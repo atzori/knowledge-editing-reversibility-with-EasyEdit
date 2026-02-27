@@ -17,7 +17,7 @@ hf_subset: null
 
 # - Local dataset path (JSON/JSONL):
 exp_dataset_path: ""
-exp_counterfact_percent_key: 0.5
+exp_counterfact_percent: 0.001
 
 # Sampling / selection
 exp_sample_k: null

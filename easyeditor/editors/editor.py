@@ -58,7 +58,7 @@ class BaseEditor:
         self.apply_algo = ALG_DICT[hparams.alg_name]
         self.alg_name = hparams.alg_name
         make_logs()
-        LOG.info("Instantiating model")
+        #LOG.info("Instantiating model")
 
         if type(self.model_name) is str:
             device_map = 'auto' if hparams.model_parallel else None
