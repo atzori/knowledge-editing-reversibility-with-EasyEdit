@@ -628,8 +628,8 @@ def run_edit_and_rollback_engine(
     if sample is None:
         raise ValueError("Missing required argument: sample (single CounterFact record).")
 
-    if mode not in ("forward", "inverse", "both"):
-        raise ValueError(f"Invalid mode='{mode}'. Expected forward|inverse|both.")
+    if mode not in ("forward", "both"):
+        raise ValueError(f"Invalid mode='{mode}'. Expected forward|both.")
 
     t0 = perf_counter()
 
@@ -933,23 +933,6 @@ def run_edit_and_rollback_engine(
                     log_step("Aborted: CUDA OOM while computing PPL on M1.", "ERROR")
                     return results_json
                 raise
-
-    # Inverse-only stage
-    if mode == "inverse":
-        log_step(f"{method.upper()} INVERSE-only: applying 1 edit (NEW -> GT).", "INFO")
-        try:
-            inv_model = _run_stage(
-                stage_key="inverse_only",
-                phase="rollback",
-                model_before=editor.model,
-                apply_requests=inv_apply_requests,
-                move_label=None,
-            )
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during INVERSE-only stage.", "ERROR")
-                return results_json
-            raise
 
     # Rollback stage
     if mode == "both":

@@ -225,7 +225,7 @@ def normalize_counterfact_record(rec: Dict[str, Any]) -> Dict[str, Any]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Path to YAML config.")
-    ap.add_argument("--mode", default="both", choices=["forward", "inverse", "both"])
+    ap.add_argument("--mode", default="both", choices=["forward", "both"])
     args = ap.parse_args()
 
     cfg_path = Path(args.config).expanduser().resolve()
