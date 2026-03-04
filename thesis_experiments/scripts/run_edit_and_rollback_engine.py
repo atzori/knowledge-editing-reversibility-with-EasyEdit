@@ -636,23 +636,9 @@ def run_edit_and_rollback_engine(
     results_json: Dict[str, Any] = {
         "timestamp_utc": datetime.utcnow().isoformat(),
         "elapsed_sec": None,  # filled only at the very end
-        "config_path": str(Path(config_path)),
         "mode": mode,
         "method": None,
-        "dataset_type": "counterfact",
-        "dataset_source": "wrapper_sample",
-        "dataset_size_loaded": 1,
         "sample_index": None,
-        "case_id": sample.get("case_id", ""),
-        "prompt": str(sample.get("prompt", "")).rstrip(),
-        "subject": str(sample.get("subject", "")).rstrip(),
-        "ground_truth": str(sample.get("ground_truth", "")).rstrip(),
-        "target_new": str(sample.get("target_new", "")).rstrip(),
-        "counts": {
-            "locality_prompts": len(sample.get("locality_prompts", []) or []),
-            "portability_prompts": len(sample.get("portability_prompts", []) or []),
-            "ppl_texts": None,
-        },
         "ppl": {},       # M0/M1/M2 mean_ppl
         "be_report": {}, # M1/M2 report dicts
         "metrics": {},   # forward/inverse_only/rollback
@@ -669,7 +655,6 @@ def run_edit_and_rollback_engine(
     if not isinstance(cfg, dict):
         raise ValueError(f"Invalid YAML structure (expected mapping) in: {cfg_path}")
 
-    results_json["exp_config"] = cfg
 
     method = str(cfg.get("exp_method", "rome")).lower().strip()
     if method not in ("rome", "memit"):
@@ -733,8 +718,6 @@ def run_edit_and_rollback_engine(
         elif hparams is None:
             raise_path_error("Hparams config file", exp_hparams_path)
 
-    results_json["hparams_config"] = hparams_cfg if hparams_cfg else None
-
     force_hf_home()
     if hparams is None:
         if exp_hparams_path is None:
@@ -753,8 +736,6 @@ def run_edit_and_rollback_engine(
     for attr in ["model_path", "cache_dir", "model_dir"]:
         if hasattr(runtime_hparams, attr):
             setattr(runtime_hparams, attr, None)
-
-    results_json["hparams"] = _hparams_to_dict(runtime_hparams)
 
     # Ensure stats_dir exists if present in hparams
     if hasattr(runtime_hparams, "stats_dir"):
@@ -815,7 +796,6 @@ def run_edit_and_rollback_engine(
             text_key=be_ppl_text_key,
             max_items=be_ppl_max_items,
         )
-        results_json["counts"]["ppl_texts"] = len(ppl_texts)
 
         try:
             log_step("BE: computing PPL on M0 (baseline) (time-consuming).")
