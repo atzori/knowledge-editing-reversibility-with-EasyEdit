@@ -5,18 +5,9 @@
 exp_method: "rome"
 exp_hparams_path: "thesis_experiments/configs/hparams_rome_gptj6b.yaml"
 
-# Dataset type: "knowedit" or "counterfact"
-exp_dataset_type: "counterfact"
-exp_local_dataset: thesis_experiments/data/counterfact/test.json
-
-# Dataset source (choose ONE):
-# - HuggingFace dataset:
-hf_dataset: "azhx/counterfact"
-hf_split: "test"
-hf_subset: null
-
 # - Local dataset path (JSON/JSONL):
 exp_dataset_path: ""
+exp_counterfact_percent: 0.5
 
 # Sampling / selection
 exp_sample_k: null
@@ -28,7 +19,7 @@ exp_reverse_out_path: "logs/reverse_counterfact_gptj6b_rome.jsonl"
 # Runner controls
 exp_forced_model_name: "EleutherAI/gpt-j-6b"
 exp_eval_metric: "log_prob"
-exp_suppress_internal_prints: false
+exp_suppress_internal_prints: true
 exp_verbose: false
 exp_allow_hf_fallback: false
 
