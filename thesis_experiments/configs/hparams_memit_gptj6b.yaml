@@ -39,4 +39,4 @@ lm_head_module: "lm_head"
 stats_dir: "thesis_experiments/stats"
 device: 0
 model_parallel: true
-fp16: false
+fp16: true

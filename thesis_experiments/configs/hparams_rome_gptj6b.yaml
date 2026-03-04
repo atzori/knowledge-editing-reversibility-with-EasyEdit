@@ -7,7 +7,7 @@ model_name: "./hugging_cache/gpt-j-6B"
 # ROME regularization / misc
 v_weight_decay: 0.5
 kl_factor: 0.0625
-mom2_adjustment: false
+mom2_adjustment: true
 
 # Second-moment (mom2) stats settings
 mom2_dataset: "wikipedia"
@@ -41,4 +41,4 @@ context_template_length_params:
 stats_dir: "thesis_experiments/stats"
 device: 0
 model_parallel: true
-fp16: false
+fp16: true

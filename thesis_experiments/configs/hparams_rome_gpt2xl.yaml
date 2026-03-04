@@ -15,7 +15,7 @@ mom2_n_samples: 10000
 mom2_dtype: "float32"
 
 # Core ROME parameters
-layers: [17] # Layers to consider for editing, 17, 20 for GPT-2 XL is better than only 17
+layers: [17]
 fact_token: "subject_last"
 
 v_num_grad_steps: 20
