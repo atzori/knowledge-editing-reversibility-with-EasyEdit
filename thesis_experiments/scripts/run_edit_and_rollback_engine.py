@@ -20,7 +20,6 @@ from easyeditor.evaluate.evaluate_utils import batch_target_log_likelihood
 
 from thesis_experiments.scripts.ke_core import (
     force_hf_home,
-    generate_completion,
     get_tokenizer,
     load_hparams,
 )
@@ -221,30 +220,6 @@ def _compute_and_store_be(
             float(collapse_abs_threshold) if collapse_abs_threshold is not None else None
         ),
     }
-
-
-def _run_behavioral_probe(
-    *,
-    model,
-    tok,
-    prompt: str,
-    max_new_tokens: int,
-    temperature: float,
-    do_sample: bool,
-    probe_log_label: str,
-    probe_title: str,
-) -> None:
-    log_step(probe_log_label)
-    completion = generate_completion(
-        model,
-        tok,
-        prompt,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        do_sample=do_sample,
-    )
-    print(f"\n=== {probe_title} ===")
-    print(completion)
 
 
 def _resolve_eval_metric(exp_eval_metric: Optional[str], method: str) -> str:
@@ -703,9 +678,6 @@ def run_edit_and_rollback_engine(
 
     # Runner params
     forced_model_name = str(cfg.get("exp_forced_model_name", "gpt2-xl")).strip()
-    max_new_tokens = _as_int(cfg.get("exp_max_new_tokens", 20), 20)
-    temperature = float(cfg.get("exp_temperature", 1.0) or 1.0)
-    do_sample = _as_bool(cfg.get("exp_do_sample", False), False)
     suppress_internal = _as_bool(cfg.get("exp_suppress_internal_prints", True), True)
     eval_metric = _resolve_eval_metric(cfg.get("exp_eval_metric", None), method)
     enable_portability_metrics = _as_bool(cfg.get("exp_enable_portability_metrics", False), False)
@@ -864,26 +836,6 @@ def run_edit_and_rollback_engine(
             raise
 
     # ----------------------------
-    # M0: behavioral probe
-    # ----------------------------
-    try:
-        _run_behavioral_probe(
-            model=editor.model,
-            tok=tok,
-            prompt=results_json["prompt"],
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=do_sample,
-            probe_log_label="Behavioral probe (M0) on sample.",
-            probe_title="Behavioral probe (M0)",
-        )
-    except RuntimeError as e:
-        if _is_cuda_oom(e):
-            log_step("Aborted: CUDA OOM during behavioral probe (M0).", "ERROR")
-            return results_json
-        raise
-
-    # ----------------------------
     # Build requests (single)
     # ----------------------------
     eval_request = _build_eval_requests_single(sample)[0]
@@ -999,23 +951,6 @@ def run_edit_and_rollback_engine(
                 return results_json
             raise
 
-        try:
-            _run_behavioral_probe(
-                model=inv_model,
-                tok=tok,
-                prompt=results_json["prompt"],
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-                probe_log_label="Behavioral probe (after inverse-only) on sample.",
-                probe_title="Behavioral probe (after inverse-only)",
-            )
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during behavioral probe (inverse-only).", "ERROR")
-                return results_json
-            raise
-
     # Rollback stage
     if mode == "both":
         if edited_model is None:
@@ -1058,23 +993,6 @@ def run_edit_and_rollback_engine(
                     log_step("Aborted: CUDA OOM while computing PPL on M2.", "ERROR")
                     return results_json
                 raise
-
-        try:
-            _run_behavioral_probe(
-                model=rollback_model,
-                tok=tok,
-                prompt=results_json["prompt"],
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-                probe_log_label="Behavioral probe (M2) on sample.",
-                probe_title="Behavioral probe (M2)",
-            )
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM during behavioral probe (M2).", "ERROR")
-                return results_json
-            raise
 
     results_json["elapsed_sec"] = float(perf_counter() - t0)
     return results_json

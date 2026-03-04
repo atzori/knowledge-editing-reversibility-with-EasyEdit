@@ -28,10 +28,7 @@ exp_reverse_out_path: "logs/reverse_counterfact_gpt2xl_memit.jsonl"
 # Runner controls
 exp_forced_model_name: "gpt2-xl"
 exp_eval_metric: "log_prob"
-exp_max_new_tokens: 5
-exp_temperature: 0.7
 exp_num_edits: 30
-exp_do_sample: true
 exp_suppress_internal_prints: false
 exp_verbose: false
 exp_allow_hf_fallback: false
