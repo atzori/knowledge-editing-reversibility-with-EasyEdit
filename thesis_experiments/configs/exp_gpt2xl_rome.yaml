@@ -7,11 +7,10 @@ exp_hparams_path: "thesis_experiments/configs/old/hparams_rome_gpt2xl_alt.yaml"
 
 # - Local dataset path (JSON/JSONL):
 exp_dataset_path: ""
-exp_counterfact_percent: 0.5
+exp_counterfact_n_samples: 1000
 
 # Sampling / selection
 exp_sample_k: null
-exp_sample_index: 100
 exp_seed: 42
 exp_reverse_start_index: 0
 exp_reverse_out_path: "logs/reverse_counterfact_gpt2xl_rome.jsonl"

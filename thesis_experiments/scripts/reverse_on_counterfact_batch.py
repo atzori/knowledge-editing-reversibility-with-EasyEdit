@@ -239,13 +239,27 @@ def main() -> None:
     total_n = len(raw_records)
     engine_batch.log_step(f"CounterFact size: {total_n} | Local path: {cf_json_path}", "INFO")
 
-    # Allow choosing which YAML key controls the fraction of CounterFact to run.
-    # Default is exp_counterfact_percent, but you can override with exp_counterfact_percent_key.
-    percent_key = str(cfg.get("exp_counterfact_percent_key", "exp_counterfact_percent")).strip() or "exp_counterfact_percent"
-    frac = _normalize_fraction(cfg.get(percent_key, 1.0), default=1.0)
-
     start_idx = int(cfg.get("exp_reverse_start_index", 0))
-    end_idx = int(total_n * frac)
+    n_samples_key = str(cfg.get("exp_counterfact_n_samples_key", "exp_counterfact_n_samples")).strip() or "exp_counterfact_n_samples"
+    n_samples_raw = cfg.get(n_samples_key, None)
+    if n_samples_raw is None:
+        # Backward-compatible fallback for old configs.
+        percent_key = str(cfg.get("exp_counterfact_percent_key", "exp_counterfact_percent")).strip() or "exp_counterfact_percent"
+        frac = _normalize_fraction(cfg.get(percent_key, 1.0), default=1.0)
+        n_samples = max(0, int(total_n * frac) - start_idx)
+        engine_batch.log_step(
+            f"'{n_samples_key}' not found. Fallback to '{percent_key}' ({frac:.2%}) -> n_samples={n_samples}.",
+            "WARNING",
+        )
+    else:
+        try:
+            n_samples = int(n_samples_raw)
+        except Exception as e:
+            raise ValueError(f"{n_samples_key} must be an integer. Got: {n_samples_raw}") from e
+        if n_samples <= 0:
+            raise ValueError(f"{n_samples_key} must be > 0. Got: {n_samples}")
+
+    end_idx = min(total_n, start_idx + n_samples)
 
     method = str(args.alg or cfg.get("alg", cfg.get("exp_method", "rome"))).strip().lower()
     if method not in ("rome", "memit"):
@@ -254,7 +268,8 @@ def main() -> None:
 
     engine_batch.log_step(
         f"Running on CounterFact indices: start={start_idx}, end={end_idx} "
-        f"(fraction={frac:.2%}, percent_key={percent_key}, alg={method})",
+        f"(n_samples_requested={n_samples}, n_samples_effective={max(0, end_idx - start_idx)}, "
+        f"n_samples_key={n_samples_key}, alg={method})",
         "INFO",
     )
 
@@ -265,20 +280,25 @@ def main() -> None:
             raise ValueError(f"exp_num_edits must be > 0 for MEMIT. Got: {exp_num_edits}")
 
         # Sliding window with overlap=1:
+        # - exp_counterfact_n_samples controls only the number of START positions.
+        # - each window can extend beyond (start_idx + n_samples - 1), up to dataset end.
         # iter i -> [start+i, ..., start+i+exp_num_edits-1]
         i = 0
         while True:
             win_start = start_idx + i
             win_end = win_start + exp_num_edits
-            if win_end > end_idx:
+            if win_start >= end_idx:
+                break
+            if win_end > total_n:
                 break
             index_batches.append(list(range(win_start, win_end)))
             i += 1
 
         if not index_batches:
             raise RuntimeError(
-                f"No MEMIT windows to run: start={start_idx}, end={end_idx}, "
-                f"exp_num_edits={exp_num_edits}, total={total_n}."
+                f"No MEMIT windows to run: start={start_idx}, start_range_end={end_idx}, "
+                f"exp_num_edits={exp_num_edits}, total={total_n}. "
+                "Need at least one valid window fully contained in dataset bounds."
             )
         engine_batch.log_step(
             f"MEMIT sliding windows prepared: n_windows={len(index_batches)}, "
