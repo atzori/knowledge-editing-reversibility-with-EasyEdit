@@ -7,7 +7,7 @@ exp_hparams_path: "thesis_experiments/configs/hparams_memit_gpt2xl.yaml"
 
 # - Local dataset path (JSON/JSONL):
 exp_dataset_path: ""
-exp_counterfact_percent: 0.5
+exp_counterfact_percent: 0.0005
 
 # Sampling / selection
 exp_sample_k: null
@@ -19,8 +19,8 @@ exp_reverse_out_path: "logs/reverse_counterfact_gpt2xl_memit.jsonl"
 # Runner controls
 exp_forced_model_name: "gpt2-xl"
 exp_eval_metric: "log_prob"
-exp_num_edits: 5000
-exp_suppress_internal_prints: true
+exp_num_edits: 3
+exp_suppress_internal_prints: false
 exp_verbose: false
 exp_allow_hf_fallback: false
 exp_print_metrics_foreach_case: false
@@ -31,7 +31,7 @@ be_enabled: true
 be_ppl_data_path: data/me_ppl/ME-PPL_1k.json
 be_ppl_text_key: "Text"
 be_ppl_max_items: 1000
-be_ppl_batch_size: 100
+be_ppl_batch_size: 10
 be_ppl_add_start_token: false
 be_ppl_max_length: 128
 
