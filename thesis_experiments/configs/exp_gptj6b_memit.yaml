@@ -30,7 +30,7 @@ be_enabled: true
 be_ppl_data_path: data/me_ppl/ME-PPL_1k.json
 be_ppl_text_key: "Text"
 be_ppl_max_items: 1000
-be_ppl_batch_size: 10
+be_ppl_batch_size: 100
 be_ppl_add_start_token: false
 be_ppl_max_length: 128
 
