@@ -9,11 +9,11 @@ degradation via perplexity on a neutral text set (not the edited prompt). :conte
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import torch
 from torch.nn import CrossEntropyLoss
 from tqdm.auto import tqdm
@@ -102,12 +102,15 @@ def compute_ppl(
     max_length: Optional[int] = None,
 ) -> Tuple[float, List[float]]:
     """
-    Compute mean perplexity over `texts` and return (mean_ppl, ppl_per_text).
+    Compute global perplexity over `texts` and return (global_ppl, []).
 
     Notes:
     - Uses token-level cross-entropy with shifting (next-token prediction).
-    - PPL per text is exp(mean NLL over non-padding tokens).
-    This matches the standard approach used in the reference script. :contentReference[oaicite:4]{index=4}
+    - Applies attention-mask to ignore padding tokens.
+    - Global PPL is computed as exp(total_nll / total_valid_tokens), i.e.
+      the standard LM definition exp(mean token-level NLL).
+    - The second returned value is kept as an empty list only for backward
+      compatibility with existing call-sites that unpack two outputs.
     """
     if not texts:
         raise ValueError("texts is empty.")
@@ -130,7 +133,8 @@ def compute_ppl(
         max_tokenized_len = max_length - 1 if add_start_token else max_length
 
     loss_fct = CrossEntropyLoss(reduction="none")
-    ppls: List[float] = []
+    total_nll = 0.0
+    total_tokens = 0
 
     # Iterate in mini-batches and move only the active batch to GPU.
     n = len(texts)
@@ -183,14 +187,15 @@ def compute_ppl(
         # Mask padding tokens
         token_nll = token_nll * shift_attn
 
-        # Mean NLL per sample, then exp -> PPL
-        denom = torch.clamp(shift_attn.sum(1), min=1)
-        ppl_batch = torch.exp(token_nll.sum(1) / denom)
+        total_nll += float(token_nll.sum().item())
+        total_tokens += int(shift_attn.sum().item())
 
-        ppls.extend(ppl_batch.detach().cpu().tolist())
+    if total_tokens <= 0:
+        raise ValueError("No valid (non-padding) tokens found for PPL computation.")
 
-    mean_ppl = float(np.mean(ppls))
-    return mean_ppl, [float(x) for x in ppls]
+    mean_nll = total_nll / float(total_tokens)
+    global_ppl = float(math.exp(mean_nll))
+    return global_ppl, []
 
 
 def butterfly_report(ppl_before: float, ppl_after: float) -> ButterflyPPLReport:
