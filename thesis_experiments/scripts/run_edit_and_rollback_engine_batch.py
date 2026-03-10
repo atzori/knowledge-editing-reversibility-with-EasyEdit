@@ -638,6 +638,7 @@ def run_edit_and_rollback_engine(
     samples: Optional[List[Dict[str, Any]]] = None,
     indices: Optional[List[int]] = None,
     alg: Optional[str] = None,
+    ppl_start: Optional[float] = None,
     sample: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -651,6 +652,7 @@ def run_edit_and_rollback_engine(
       - `samples`: list of normalized CounterFact records
       - `indices`: list of dataset indices aligned with samples
       - `alg`: optional explicit method override ('rome'|'memit')
+      - `ppl_start`: optional precomputed M0 PPL to skip baseline PPL computation
     """
     if mode not in ("forward", "both"):
         raise ValueError(f"Invalid mode='{mode}'. Expected forward|both.")
@@ -843,6 +845,14 @@ def run_edit_and_rollback_engine(
     ppl_m0: Optional[float] = None
 
     if be_enabled:
+        if ppl_start is not None:
+            try:
+                ppl_m0 = float(ppl_start)
+            except Exception as e:
+                raise ValueError(f"Invalid ppl_start value: {ppl_start}") from e
+            if np.isnan(ppl_m0) or np.isinf(ppl_m0) or ppl_m0 < 0:
+                raise ValueError(f"ppl_start must be a finite non-negative float. Got: {ppl_start}")
+
         if not be_ppl_data_path_raw:
             raise ValueError("be_enabled=True but 'be_ppl_data_path' is missing in config YAML.")
         be_ppl_data_path = Path(be_ppl_data_path_raw)
@@ -856,23 +866,27 @@ def run_edit_and_rollback_engine(
             max_items=be_ppl_max_items,
         )
 
-        try:
-            log_step("BE: computing PPL on M0 (baseline) (time-consuming).")
-            ppl_m0, _ = compute_ppl(
-                texts=ppl_texts,
-                model=editor.model,
-                tokenizer=tok,
-                device=device,
-                batch_size=be_ppl_batch_size,
-                add_start_token=be_ppl_add_start_token,
-                max_length=be_ppl_max_length,
-            )
+        if ppl_m0 is not None:
+            log_step(f"BE: using provided ppl_start for M0: {ppl_m0:.6f}", "INFO")
             results_json["ppl"]["M0"] = float(ppl_m0)
-        except RuntimeError as e:
-            if _is_cuda_oom(e):
-                log_step("Aborted: CUDA OOM while computing PPL on M0.", "ERROR")
-                return results_json
-            raise
+        else:
+            try:
+                log_step("BE: computing PPL on M0 (baseline) (time-consuming).")
+                ppl_m0, _ = compute_ppl(
+                    texts=ppl_texts,
+                    model=editor.model,
+                    tokenizer=tok,
+                    device=device,
+                    batch_size=be_ppl_batch_size,
+                    add_start_token=be_ppl_add_start_token,
+                    max_length=be_ppl_max_length,
+                )
+                results_json["ppl"]["M0"] = float(ppl_m0)
+            except RuntimeError as e:
+                if _is_cuda_oom(e):
+                    log_step("Aborted: CUDA OOM while computing PPL on M0.", "ERROR")
+                    return results_json
+                raise
 
     for i, s in enumerate(selected_samples):
         if not str(s.get("prompt", "")).strip():

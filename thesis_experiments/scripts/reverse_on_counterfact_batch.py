@@ -227,6 +227,7 @@ def main() -> None:
     ap.add_argument("--config", required=True, help="Path to YAML config.")
     ap.add_argument("--mode", default="both", choices=["forward", "both"])
     ap.add_argument("--alg", default=None, choices=["rome", "memit"], help="Override algorithm method.")
+    ap.add_argument("--ppl-start", type=float, default=None, help="Optional precomputed M0 PPL to skip baseline PPL computation.")
     args = ap.parse_args()
 
     cfg_path = Path(args.config).expanduser().resolve()
@@ -364,6 +365,7 @@ def main() -> None:
                     samples=samples,
                     indices=indices,
                     alg=method,
+                    ppl_start=args.ppl_start,
                 )
 
             f_out.write(json.dumps(result, ensure_ascii=False) + "\n")

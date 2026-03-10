@@ -7,12 +7,12 @@ exp_hparams_path: "thesis_experiments/configs/hparams_rome_gptj6b.yaml"
 
 # - Local dataset path (JSON/JSONL):
 exp_dataset_path: ""
-exp_counterfact_n_samples: 1000
+exp_counterfact_n_samples: 118
 
 # Sampling / selection
 exp_sample_k: null
 exp_seed: 42
-exp_reverse_start_index: 0
+exp_reverse_start_index: 882
 exp_reverse_out_path: "logs/reverse_counterfact_gptj6b_rome.jsonl"
 
 # Runner controls
@@ -28,7 +28,7 @@ be_enabled: true
 be_ppl_data_path: data/me_ppl/ME-PPL_1k.json
 be_ppl_text_key: "Text"
 be_ppl_max_items: 1000
-be_ppl_batch_size: 100
+be_ppl_batch_size: 32
 be_ppl_add_start_token: false
 be_ppl_max_length: 128
 
