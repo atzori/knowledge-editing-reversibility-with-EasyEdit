@@ -218,8 +218,7 @@ thesis_experiments/configs/
 ### 4.5 Run the Reference Script
 
 ```bash
-python -m thesis_experiments.scripts.run_edit_and_rollback \
-  --config thesis_experiments/configs/exp_gpt2xl_memit.yaml
+python -m thesis_experiments.scripts.reverse_on_counterfact_batch --config thesis_experiments/configs/exp_gpt2xl_rome.yaml --alg rome
 ```
 
 ---
