@@ -3,7 +3,7 @@
 # ROME/MEMIT algorithm hyperparameters live ONLY in exp_hparams_path.
 
 exp_method: "rome"
-exp_hparams_path: "thesis_experiments/configs/old/hparams_rome_gpt2xl_alt.yaml"
+exp_hparams_path: "thesis_experiments/configs/hparams_rome_gpt2xl.yaml"
 
 # - Local dataset path (JSON/JSONL):
 exp_dataset_path: ""

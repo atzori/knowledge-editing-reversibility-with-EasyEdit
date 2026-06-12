@@ -133,6 +133,8 @@ class BaseTrainer:
         if os.path.exists(self.save_path):
             bk_path = f"{self.save_path}.bk"
             LOG.info(f"Moving old archive to {bk_path}")
+            if os.path.exists(bk_path):
+                os.remove(bk_path)
             os.rename(self.save_path, bk_path)
 
         torch.save(obj, self.save_path)

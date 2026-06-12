@@ -1,0 +1,34 @@
+# Experiment config — MEND on GPT-2-XL
+# Controls dataset selection and runner options.
+# MEND algorithm hyperparameters live in exp_hparams_path.
+
+exp_method: "mend"
+exp_hparams_path: "thesis_experiments/configs/hparams_mend_gpt2xl.yaml"
+
+exp_dataset_path: ""
+exp_counterfact_n_samples: 1000
+
+exp_sample_k: null
+exp_seed: 42
+exp_reverse_start_index: 0
+exp_reverse_out_path: "logs/reverse_counterfact_gpt2xl_mend.jsonl"
+
+exp_forced_model_name: "gpt2-xl"
+exp_eval_metric: "log_prob"
+exp_suppress_internal_prints: true
+exp_verbose: false
+exp_allow_hf_fallback: false
+exp_print_metrics_foreach_case: false
+
+# Backward evaluation (ME-PPL) settings
+be_enabled: true
+
+be_ppl_data_path: data/me_ppl/ME-PPL_1k.json
+be_ppl_text_key: "Text"
+be_ppl_max_items: 1000
+be_ppl_batch_size: 32
+be_ppl_add_start_token: false
+be_ppl_max_length: 128
+
+be_collapse_rel_threshold: 1.5
+be_collapse_abs_threshold: null

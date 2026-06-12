@@ -1,0 +1,81 @@
+# MEND hyperparameters for GPT-2-XL
+# Based on: https://github.com/nicola-decao/MEND
+#
+# IMPORTANT — set `archive` to the path of your pre-trained MEND checkpoint.
+# The checkpoint directory must contain the files saved by MEND training,
+# typically something like:  results/models/MEND/gpt2-xl/
+# A relative path is resolved from the repo root at runtime.
+
+alg: "MEND"
+model_name: "gpt2-xl"
+model_class: "GPT2LMHeadModel"
+tokenizer_class: "GPT2Tokenizer"
+tokenizer_name: "gpt2-xl"
+
+# ------------------------------------------------------------------
+# CHECKPOINT PATH  (fill this in before running)
+# ------------------------------------------------------------------
+archive: "thesis_experiments/checkpoints/mend/gpt2-xl"
+
+# Parameters edited by MEND (last 3 MLP layers of GPT-2-XL, layers 45-47)
+inner_params:
+  - transformer.h.45.mlp.c_proj.weight
+  - transformer.h.45.mlp.c_fc.weight
+  - transformer.h.46.mlp.c_proj.weight
+  - transformer.h.46.mlp.c_fc.weight
+  - transformer.h.47.mlp.c_proj.weight
+  - transformer.h.47.mlp.c_fc.weight
+
+# MEND algorithm hyperparameters (same as the paper defaults)
+lr: 1.0e-6
+edit_lr: 1.0e-4
+lr_lr: 1.0e-4
+seed: 42
+cedit: 0.1
+cloc: 1.0
+cbase: 1.0
+dropout: 0.0
+train_base: false
+no_grad_layers: null
+one_sided: false
+n_hidden: 1
+hidden_dim: null
+init: "id"
+norm: true
+combine: true
+x_only: false
+delta_only: false
+act: "relu"
+rank: 1920
+mlp_class: "IDMLP"
+shared: true
+
+# Runtime
+device: 0
+model_parallel: true
+half: false
+
+# Inference-only settings
+eval_only: true
+debug: false
+save: false
+verbose: false
+silent: false
+
+# Training settings (required by the dataclass but unused at inference time)
+batch_size: 1
+model_save_pt: 5000
+log_interval: 1000
+eval_log_interval: 1000
+final_eval: true
+val_interval: 1000
+early_stop_patience: 20000
+early_stop_key: "loss/total_edit_val"
+val_batch_size: 5
+accumulate_bs: 10
+val_steps: 500
+opt: "Adam"
+grad_clip: 100.0
+max_iters: 100000
+
+results_dir: "logs/mend"

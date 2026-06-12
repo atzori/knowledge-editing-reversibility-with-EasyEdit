@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from transformers.utils import logging as hf_logging
 
 from easyeditor import BaseEditor, ROMEHyperParams, MEMITHyperParams
+from easyeditor.models.mend import MENDHyperParams
 
 
 # ----------------------------
@@ -29,7 +30,9 @@ def load_hparams(method: str, hparams_path: str):
         return ROMEHyperParams.from_hparams(hparams_path)
     if method == "memit":
         return MEMITHyperParams.from_hparams(hparams_path)
-    raise ValueError("Unsupported method. Use 'rome' or 'memit'.")
+    if method == "mend":
+        return MENDHyperParams.from_hparams(hparams_path)
+    raise ValueError(f"Unsupported method '{method}'. Supported: rome, memit, mend.")
 
 
 def get_tokenizer(editor: BaseEditor, model_name: str):

@@ -53,6 +53,10 @@ warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 startTime = str(datetime.now().isoformat()).replace(":", "")
 set_start_time(startTime)
 
+# Methods that apply multiple edits per call (batch mode).
+# Keep in sync with BATCH_METHODS in counterfact_io.py.
+_BATCH_METHODS: frozenset = frozenset({"memit"})
+
 
 # ----------------------------
 # Path utilities (portable)
@@ -245,8 +249,8 @@ def _resolve_eval_metric(exp_eval_metric: Optional[str], method: str) -> str:
             )
         return aliases[metric_raw]
 
-    # Default to ROME-style probabilistic evaluation for editing experiments.
-    if method in ("rome", "memit"):
+    # Default to probabilistic evaluation for gradient-based editing methods.
+    if method in ("rome", "memit", "mend", "ft", "ft-l"):
         return "log_prob"
     return "exact match"
     
@@ -684,8 +688,6 @@ def run_edit_and_rollback_engine(
 
     method_raw = alg if alg is not None else cfg.get("alg", cfg.get("exp_method", "rome"))
     method = str(method_raw).lower().strip()
-    if method not in ("rome", "memit"):
-        raise ValueError(f"Invalid method='{method}'. Must be 'rome' or 'memit'.")
     results_json["method"] = method
 
     # Runner params
@@ -705,11 +707,11 @@ def run_edit_and_rollback_engine(
         raise ValueError("Missing input samples. Pass `samples=[...]` or legacy `sample=...`.")
     input_indices: List[int] = [int(i) for i in (indices or [])]
 
-    if method == "rome":
+    if method not in _BATCH_METHODS:
         if len(input_samples) > 1:
-            log_step("alg=rome received multiple samples; only the first one will be used.", "WARNING")
+            log_step(f"alg={method} received multiple samples; only the first one will be used.", "WARNING")
         if len(input_indices) > 1:
-            log_step("alg=rome received multiple indices; only indices[0] will be used.", "WARNING")
+            log_step(f"alg={method} received multiple indices; only indices[0] will be used.", "WARNING")
         selected_samples = [input_samples[0]]
         selected_indices = [input_indices[0]] if input_indices else []
     else:
@@ -717,7 +719,7 @@ def run_edit_and_rollback_engine(
         selected_indices = input_indices
         if selected_indices and len(selected_indices) != len(selected_samples):
             raise ValueError(
-                "For alg=memit, `indices` length must match `samples` length "
+                f"For alg={method}, `indices` length must match `samples` length "
                 f"(got indices={len(selected_indices)}, samples={len(selected_samples)})."
             )
 
@@ -914,7 +916,7 @@ def run_edit_and_rollback_engine(
     # evaluate rewrite/paraphrase/neighborhood over the full batch and aggregate.
     # Reference: Meng et al. (2022), "Mass-editing memory in a transformer",
     # experiments/evaluation section.
-    aggregate_only = method == "memit"
+    aggregate_only = method in _BATCH_METHODS
 
     edited_model = None
     rollback_model = None
