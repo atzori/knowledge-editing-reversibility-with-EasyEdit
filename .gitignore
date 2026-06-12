@@ -22,3 +22,6 @@ delta.txt
 # ROME/MEMIT cached stats (generated artifacts)
 thesis_experiments/stats/
 *.npz
+
+#checkpoints
+thesis_experiments/checkpoints/
