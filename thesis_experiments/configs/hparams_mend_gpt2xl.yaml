@@ -7,6 +7,7 @@
 # A relative path is resolved from the repo root at runtime.
 
 alg: "MEND"
+alg_name: "MEND"
 model_name: "gpt2-xl"
 model_class: "GPT2LMHeadModel"
 tokenizer_class: "GPT2Tokenizer"
@@ -30,6 +31,7 @@ inner_params:
 lr: 1.0e-6
 edit_lr: 1.0e-4
 lr_lr: 1.0e-4
+lr_scale: 1.0
 seed: 42
 cedit: 0.1
 cloc: 1.0
